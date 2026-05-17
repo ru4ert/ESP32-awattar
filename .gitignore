@@ -1,0 +1,8 @@
+# PlatformIO Build-Output
+.pio/
+
+# WiFi-Zugangsdaten (NIEMALS committen!)
+include/secrets.h
+
+
+.vscode
