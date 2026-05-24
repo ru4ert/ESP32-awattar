@@ -5,9 +5,11 @@
 #pragma once
 
 // ── Treiber ──────────────────────────────────────────────────────────────────
-#define ILI9341_DRIVER
+#define ST7789_DRIVER
+// #define ILI9341_DRIVER  // Auskommentiert - dieser CYD hat ST7789
 
-// ── Display SPI Pins (HSPI) ──────────────────────────────────────────────────
+#define TFT_WIDTH  240
+#define TFT_HEIGHT 320
 #define TFT_MISO  12
 #define TFT_MOSI  13
 #define TFT_SCLK  14

@@ -29,10 +29,14 @@ const char* TZ_VIENNA   = "CET-1CEST,M3.5.0,M10.5.0/3";  // auto DST
 const char* NTP1        = "pool.ntp.org";
 const char* NTP2        = "at.pool.ntp.org";
 
-#define SCREEN_W  320
-#define SCREEN_H  240
+// Dynamische Dimensionen – liest echte tft-Werte nach init()+setRotation()
+#define SCREEN_W  (tft.width())
+#define SCREEN_H  (tft.height())
 #define HDR_H      24
 #define FTR_H      26
+
+// ── Touch Debug ──────────────────────────────────────────────
+#define TOUCH_DEBUG  0   // 0 = normal, 1 = Debug-Punkt
 
 #define FETCH_INTERVAL 3600000UL   // 1 h in ms
 #define MINUTE_TICK      60000UL
@@ -46,6 +50,8 @@ const char* NTP2        = "at.pool.ntp.org";
 #define C_GRAY    0x4208
 #define C_WHITE   0xFFFF
 #define C_CYAN    0x07FF
+#define C_SILVER  0xBDF7  // Hellgrau (bekannt funktionierend)
+#define C_DKGREEN 0x03E0  // Dunkelgrün = C_GREEN bei halber Helligkeit
 
 // ── Daten ────────────────────────────────────────────────────
 struct HourSlot { time_t ts; float ct; };  // ct/kWh
@@ -63,8 +69,13 @@ bool   showToday     = true;
 bool   needsRedraw   = true;
 int    tooltipIdx    = -1;
 
-unsigned long lastFetch  = 0;
-unsigned long lastMinute = 0;
+unsigned long lastFetch    = 0;
+unsigned long lastMinute   = 0;
+unsigned long lastActivity = 0;
+unsigned long sleepTime    = 0;
+bool          displayOn    = true;
+
+#define SLEEP_TIMEOUT  30000UL  // 30 Sekunden
 
 // ── Prototypen ───────────────────────────────────────────────
 void     connectWiFi();
@@ -90,7 +101,7 @@ void setup() {
 
     // Display
     tft.init();
-    tft.setRotation(1);   // Landscape, USB auf kurzer Seite links
+    tft.setRotation(3);   // ST7789 Landscape 180° (USB links)
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(C_WHITE, TFT_BLACK);
     tft.drawString("Starte...", 10, 110, 2);
@@ -98,7 +109,10 @@ void setup() {
     // Touch (eigener SPI-Bus)
     touchSPI.begin(T_CLK, T_MISO, T_MOSI, T_CS);
     ts.begin(touchSPI);
-    ts.setRotation(1);
+    ts.setRotation(3);
+
+    // Dimensionen nach setRotation() loggen
+    Serial.printf("Display: %d x %d px\n", tft.width(), tft.height());
 
     connectWiFi();
     syncNTP();
@@ -118,6 +132,15 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
+    // ── Display-Schlaf─Timer ──
+    if (displayOn && now - lastActivity >= SLEEP_TIMEOUT) {
+        displayOn     = false;
+        sleepTime     = millis();
+        currentScreen = DASHBOARD;
+        tooltipIdx    = -1;
+        digitalWrite(21, LOW);
+    }
+
     if (now - lastFetch >= FETCH_INTERVAL) {
         isFetching = true;
         fetchPrices();
@@ -126,14 +149,14 @@ void loop() {
         needsRedraw = true;
     }
 
-    if (now - lastMinute >= MINUTE_TICK) {
+    if (displayOn && now - lastMinute >= MINUTE_TICK) {
         lastMinute  = now;
         needsRedraw = true;
     }
 
     handleTouch();
 
-    if (needsRedraw) {
+    if (displayOn && needsRedraw) {
         needsRedraw = false;
         if (currentScreen == DASHBOARD) drawDashboard();
         else                             drawChart();
@@ -180,8 +203,18 @@ bool fetchPrices() {
     if (WiFi.status() != WL_CONNECTED) { connectWiFi(); }
     if (WiFi.status() != WL_CONNECTED) return false;
 
+    // Zeitfenster: heute Mitternacht bis übermorgen Mitternacht
+    struct tm tmNow2; getLocalTime(&tmNow2);
+    tmNow2.tm_hour = 0; tmNow2.tm_min = 0; tmNow2.tm_sec = 0;
+    long long startMs = (long long)mktime(&tmNow2) * 1000LL;
+    long long endMs   = startMs + 172800000LL;  // +48h
+
+    char apiUrl[128];
+    snprintf(apiUrl, sizeof(apiUrl),
+             "%s?start=%lld&end=%lld", AWATTAR_URL, startMs, endMs);
+
     HTTPClient http;
-    http.begin(AWATTAR_URL);
+    http.begin(apiUrl);
     int code = http.GET();
     if (code != 200) { http.end(); return false; }
 
@@ -219,11 +252,20 @@ bool fetchPrices() {
 // ─────────────────────────────────────────────────────────────
 //  Helpers
 // ─────────────────────────────────────────────────────────────
+// Dashboard-Hintergrund
 uint16_t priceColor(float ct) {
-    if (ct <= 0)   return 0x03EF; // Blau-Grün (Negativpreis)
-    if (ct < 10.0) return C_GREEN;
-    if (ct < 20.0) return C_YELLOW;
-    return C_RED;
+    if (ct < 0)    return 0x0340;  // Dunkelgrün (Negativ)
+    if (ct < 5.0)  return C_GREEN; // Helles Grün
+    if (ct < 15.0) return 0x4208;  // Dunkelgrau (Mittel)
+    return C_RED;                   // Rot (Teuer)
+}
+
+// Chart-Balken
+uint16_t barColor(float ct) {
+    if (ct < 0)    return C_CYAN;   // Negativ  → erscheint blau
+    if (ct < 5.0)  return C_GREEN;  // Günstig  → erscheint grün
+    if (ct < 15.0) return C_GRAY;   // Mittel   → erscheint grau ✓
+    return C_RED;                    // Teuer    → erscheint gelb (Hardware-Limit)
 }
 
 int currentSlotIdx() {
@@ -245,6 +287,25 @@ void getFilteredSlots(HourSlot** out, int& cnt) {
         if ((showToday && isToday) || (!showToday && !isToday))
             out[cnt++] = &slots[i];
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Toast-Overlay (2 Sekunden blockierend)
+// ─────────────────────────────────────────────────────────────
+void showToast(const char* msg) {
+    const int TW = 220, TH = 32;
+    int tx = (SCREEN_W - TW) / 2;
+    int ty = (SCREEN_H - TH) / 2;
+    // Hintergrund + Rahmen
+    tft.fillRoundRect(tx, ty, TW, TH, 6, 0x2945);
+    tft.drawRoundRect(tx, ty, TW, TH, 6, C_YELLOW);
+    // Text zentriert
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_YELLOW, 0x2945);
+    tft.drawString(msg, SCREEN_W / 2, SCREEN_H / 2, 2);
+    tft.setTextDatum(TL_DATUM);
+    delay(2000);
+    needsRedraw = true;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -273,6 +334,12 @@ void drawHeader() {
         tft.setTextColor(C_YELLOW, C_HDR);
         tft.drawString("~", SCREEN_W / 2 - 4, 5, 2);
     }
+
+    // Sleep-Button (Power-Icon) links neben WiFi-Balken
+    uint16_t sleepCol = displayOn ? C_WHITE : C_YELLOW;
+    int sx = SCREEN_W - 46;  // Mitte des Icons
+    tft.drawCircle(sx, 11, 5, sleepCol);
+    tft.drawFastVLine(sx, 6, 4, sleepCol);   // Strich oben
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -283,7 +350,8 @@ void drawDashboard() {
     float ct = (cur >= 0) ? slots[cur].ct : 0.0f;
     uint16_t bg = priceColor(ct);
 
-    tft.fillRect(0, HDR_H, SCREEN_W, SCREEN_H - HDR_H - FTR_H, bg);
+    // Ganzen Screen löschen (verhindert Artefakte)
+    tft.fillScreen(bg);
     drawHeader();
 
     // Großer Preis (Font 7 = 7-Segment)
@@ -299,7 +367,7 @@ void drawDashboard() {
     tft.drawString("ct / kWh", SCREEN_W / 2, HDR_H + 120, 2);
 
     // Preis-Label (Günstig/Moderat/Teuer)
-    const char* label = (ct < 10) ? "GUENSTIG" : (ct < 20) ? "MODERAT" : "TEUER";
+    const char* label = (ct < 5) ? "GUENSTIG" : (ct < 15) ? "MODERAT" : "TEUER";
     tft.setTextColor(C_WHITE, bg);
     tft.drawString(label, SCREEN_W / 2, HDR_H + 140, 2);
 
@@ -357,42 +425,56 @@ void drawChart() {
             if (view[i]->ct > maxP) maxP = view[i]->ct;
             sum += view[i]->ct;
         }
-        float avg   = sum / cnt;
-        float range = maxP - minP;
-        if (range < 5.0f) range = 5.0f;
+        float avg = sum / cnt;
 
-        // Y-Achse Labels
-        tft.setTextColor(C_GRAY, C_BG);
+        // Feste Y-Achse in 5ct-Schritten (inkl. 0 wenn nötig)
+        float yMin   = floorf(min(minP, 0.0f) / 5.0f) * 5.0f;
+        float yMax   = ceilf(maxP / 5.0f) * 5.0f;
+        if (yMax <= yMin) yMax = yMin + 5.0f;
+        float yRange = yMax - yMin;
+
+        // Y-Achse: Grid-Linien + Labels alle 5ct
         char yb[8];
-        sprintf(yb, "%+.0f", maxP); tft.drawString(yb, 0, CY,           1);
-        sprintf(yb, "%+.0f", minP); tft.drawString(yb, 0, CY + CH - 6,  1);
+        for (float yv = yMin; yv <= yMax + 0.1f; yv += 5.0f) {
+            int yPx = CY + CH - (int)((yv - yMin) / yRange * CH);
+            if (yPx < CY || yPx > CY + CH) continue;
+            uint16_t gc = (fabsf(yv) < 0.1f) ? C_YELLOW : C_GRAY;
+            for (int x = CX; x < CX + CW; x += 8) tft.drawPixel(x, yPx, gc);
+            sprintf(yb, "%d", (int)yv);
+            tft.setTextColor(gc, C_BG);
+            tft.drawString(yb, 0, yPx - 4, 1);
+        }
 
         // Balken
         float bw = (float)CW / cnt;
         time_t nowT = time(nullptr);
         struct tm* tmN = localtime(&nowT);
         int curHour = tmN->tm_hour;
+        int curMin  = tmN->tm_min;
 
         for (int i = 0; i < cnt; i++) {
             float pr  = view[i]->ct;
-            int   bh  = max(2, (int)((pr - minP) / range * CH));
+            int   bh  = max(2, (int)((pr - yMin) / yRange * CH));
             int   bx  = CX + (int)(i * bw);
             int   by  = CY + CH - bh;
             int   bwi = max(1, (int)bw - 1);
 
-            uint16_t col = priceColor(pr);
-            tft.fillRect(bx, by, bwi, bh, col);
+            uint16_t col     = barColor(pr);
+            uint16_t fillCol = col;
+            if (i == tooltipIdx) {
+                uint8_t r = min(31, ((col >> 11) & 0x1F) + 8);
+                uint8_t g = min(63, ((col >> 5)  & 0x3F) + 16);
+                uint8_t b = min(31, (col & 0x1F) + 8);
+                fillCol = ((uint16_t)r << 11) | ((uint16_t)g << 5) | b;
+            }
+            tft.fillRect(bx, by, bwi, bh, fillCol);
 
-            // Aktueller Slot: weißer Rahmen
             struct tm* st = localtime(&view[i]->ts);
             if (showToday && st->tm_hour == curHour)
                 tft.drawRect(bx - 1, by - 1, bwi + 2, bh + 2, C_WHITE);
-
-            // Tooltip-Hervorhebung
             if (i == tooltipIdx)
-                tft.drawRect(bx, by, bwi, bh, C_WHITE);
+                tft.drawRect(bx - 1, by - 1, bwi + 2, bh + 2, C_YELLOW);
 
-            // X-Labels alle 4 h
             if (i % 4 == 0) {
                 char hb[3]; sprintf(hb, "%02d", st->tm_hour);
                 tft.setTextColor(C_GRAY, C_BG);
@@ -400,8 +482,23 @@ void drawChart() {
             }
         }
 
-        // Durchschnitts-Linie (gestrichelt)
-        int avgY = CY + CH - (int)((avg - minP) / range * CH);
+        // Aktuelle Zeit: senkrechter Cyan-Strich (heute, auf 15 min gerundet)
+        if (showToday) {
+            for (int i = 0; i < cnt; i++) {
+                struct tm* si = localtime(&view[i]->ts);
+                if (si->tm_hour == curHour) {
+                    int bx   = CX + (int)(i * bw);
+                    int qMin = (curMin / 15) * 15;
+                    int nowX = bx + (int)(qMin / 60.0f * bw);
+                    for (int y = CY; y < CY + CH; y += 4)
+                        tft.drawFastVLine(nowX, y, 2, C_CYAN);
+                    break;
+                }
+            }
+        }
+
+        // Durchschnitts-Linie (gestrichelt weiß)
+        int avgY = CY + CH - (int)((avg - yMin) / yRange * CH);
         for (int x = CX; x < CX + CW; x += 6)
             tft.drawFastHLine(x, avgY, 3, C_WHITE);
         char avgb[12]; sprintf(avgb, "o%.1f", avg);
@@ -450,14 +547,58 @@ void handleTouch() {
     if (!ts.tirqTouched() || !ts.touched()) return;
     TS_Point p = ts.getPoint();
 
-    // Rohwerte in Bildschirmkoordinaten umrechnen (Kalibrierung CYD Landscape)
-    // Rohwerte typisch: x 200–3900, y 200–3900
-    int tx = map(p.x, 200, 3900, 0, SCREEN_W);
-    int ty = map(p.y, 200, 3900, 0, SCREEN_H);
+    // Display aufwecken falls schlafen
+    if (!displayOn) {
+        if (millis() - sleepTime < 1500) return; // Mindest-Schlafzeit
+        displayOn    = true;
+        lastActivity = millis();
+        digitalWrite(21, HIGH);
+        needsRedraw  = true;
+        delay(200);
+        return;
+    }
+    lastActivity = millis();
+
+    // Kalibrierung aus gemessenen Eckwerten (raw_x: 210–3790, raw_y: 245–3900)
+    int tx = map(p.x, 3790, 210, 0, SCREEN_W);
+    int ty = map(p.y, 3900, 245, 0, SCREEN_H);
     tx = constrain(tx, 0, SCREEN_W - 1);
     ty = constrain(ty, 0, SCREEN_H - 1);
 
     Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", p.x, p.y, tx, ty);
+
+#if TOUCH_DEBUG
+    // Roter Punkt an der berechneten Position zeichnen
+    tft.fillCircle(tx, ty, 6, C_RED);
+    tft.drawCircle(tx, ty, 7, C_WHITE);
+    // Koordinaten-Label
+    char dbgBuf[40];
+    sprintf(dbgBuf, "raw(%d,%d)", p.x, p.y);
+    tft.fillRect(0, SCREEN_H - FTR_H - 14, 160, 14, C_HDR);
+    tft.setTextColor(C_YELLOW, C_HDR);
+    tft.drawString(dbgBuf, 2, SCREEN_H - FTR_H - 13, 1);
+    sprintf(dbgBuf, "px(%d,%d)", tx, ty);
+    tft.fillRect(0, SCREEN_H - FTR_H - 7, 120, 8, C_HDR);
+    tft.drawString(dbgBuf, 2, SCREEN_H - FTR_H - 6, 1);
+    delay(500); // laenger warten damit Punkt sichtbar bleibt
+    return;     // im Debug-Modus KEIN normaler Touch-Handler
+#endif
+
+    // Sleep-Button (Header, neben WiFi)
+    if (ty < HDR_H && tx > SCREEN_W - 52 && tx < SCREEN_W - 32) {
+        displayOn = !displayOn;
+        if (displayOn) {
+            lastActivity = millis();
+            digitalWrite(21, HIGH);
+            needsRedraw = true;
+        } else {
+            sleepTime     = millis();
+            currentScreen = DASHBOARD;
+            tooltipIdx    = -1;
+            digitalWrite(21, LOW);
+        }
+        return;
+    }
 
     delay(200); // Entprellen
 
@@ -486,8 +627,12 @@ void handleTouch() {
         if (ty >= btnY) {
             if (tx < 72) {                        // Heute
                 showToday = true; tooltipIdx = -1; needsRedraw = true;
-            } else if (tx < 152 && tomorrowAvail) { // Morgen
-                showToday = false; tooltipIdx = -1; needsRedraw = true;
+            } else if (tx < 152) {                // Morgen
+                if (tomorrowAvail) {
+                    showToday = false; tooltipIdx = -1; needsRedraw = true;
+                } else {
+                    showToast("Morgen noch nicht verfuegbar");
+                }
             } else if (tx >= 156) {               // Zurück
                 currentScreen = DASHBOARD; needsRedraw = true;
             }
