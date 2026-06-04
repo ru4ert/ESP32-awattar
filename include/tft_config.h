@@ -5,11 +5,23 @@
 #pragma once
 
 // ── Treiber ──────────────────────────────────────────────────────────────────
-#define ST7789_DRIVER
-// #define ILI9341_DRIVER  // Auskommentiert - dieser CYD hat ST7789
+#define ILI9341_DRIVER
 
 #define TFT_WIDTH  240
 #define TFT_HEIGHT 320
+
+#ifdef SIMULATION
+// ── Wokwi Simulator: VSPI Pins (D18/D23/D19) ─────────────────────────────────
+// Entspricht diagram.json – identisch mit funktionierendem hello-wowki Projekt.
+#define TFT_MISO  19
+#define TFT_MOSI  23
+#define TFT_SCLK  18
+#define TFT_CS    15
+#define TFT_DC     2
+#define TFT_RST    4
+#define TFT_BL    -1   // kein Backlight in Sim
+#else
+// ── Hardware: ESP32-2432S028R HSPI Pins ──────────────────────────────────────
 #define TFT_MISO  12
 #define TFT_MOSI  13
 #define TFT_SCLK  14
@@ -17,6 +29,7 @@
 #define TFT_DC     2
 #define TFT_RST   -1   // Reset nicht verwendet
 #define TFT_BL    21   // Backlight
+#endif
 
 // ── Touch (XPT2046 auf VSPI) ─────────────────────────────────────────────────
 #define TOUCH_CS  33

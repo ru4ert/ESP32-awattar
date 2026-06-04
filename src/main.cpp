@@ -8,19 +8,25 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
 #include <time.h>
 #include "secrets.h"
 
-// ── Touch-SPI (VSPI – getrennt vom Display) ──────────────────
+#ifdef SIMULATION
+// ── Simulation: FT6206 Capacitive Touch via I2C (board-ili9341-cap-touch) ──
+#include <Wire.h>
+#include <Adafruit_FT6206.h>
+Adafruit_FT6206 ctp;
+#else
+// ── Hardware: XPT2046 Resistive Touch via SPI ────────────────────────────────
+#include <XPT2046_Touchscreen.h>
 #define T_CS   33
 #define T_IRQ  36
 #define T_MOSI 32
 #define T_MISO 39
 #define T_CLK  25
-
 SPIClass           touchSPI(VSPI);
 XPT2046_Touchscreen ts(T_CS, T_IRQ);
+#endif
 TFT_eSPI           tft;
 
 // ── Konstanten ───────────────────────────────────────────────
@@ -36,7 +42,11 @@ const char* NTP2        = "at.pool.ntp.org";
 #define FTR_H      26
 
 // ── Touch Debug ──────────────────────────────────────────────
-#define TOUCH_DEBUG  0   // 0 = normal, 1 = Debug-Punkt
+#ifdef SIMULATION
+#define TOUCH_DEBUG  0   // Koordinaten OK, jetzt echte Touch-Events
+#else
+#define TOUCH_DEBUG  0   // Hardware: normal
+#endif
 
 #define FETCH_INTERVAL 3600000UL   // 1 h in ms
 #define MINUTE_TICK      60000UL
@@ -94,36 +104,66 @@ void     getFilteredSlots(HourSlot** out, int& cnt);
 // ─────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
+    Serial.println("=== SETUP START ===");
 
     // Backlight
     pinMode(21, OUTPUT);
     digitalWrite(21, HIGH);
 
     // Display
+    Serial.println("tft.init()...");
     tft.init();
-    tft.setRotation(3);   // ST7789 Landscape 180° (USB links)
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(C_WHITE, TFT_BLACK);
-    tft.drawString("Starte...", 10, 110, 2);
+    Serial.println("tft.init() done");
 
-    // Touch (eigener SPI-Bus)
+#ifdef SIMULATION
+    tft.setRotation(1);   // ILI9341 Landscape (standard, Wokwi-kompatibel)
+#else
+    tft.setRotation(3);   // Hardware: Landscape 180° (USB links)
+#endif
+
+    Serial.printf("Display: %d x %d px\n", tft.width(), tft.height());
+
+#ifdef SIMULATION
+    // Farb-Blitz um zu prüfen ob SPI funktioniert
+    Serial.println("Farb-Test...");
+    tft.fillScreen(0xF800);   // ROT
+    delay(300);
+    tft.fillScreen(0x07E0);   // GRÜN
+    delay(300);
+    tft.fillScreen(TFT_BLACK);
+    Serial.println("Farb-Test fertig");
+#endif
+
+    tft.setTextColor(C_WHITE, TFT_BLACK);
+    tft.drawString("Starte...", 10, 60, 2);
+    Serial.println("drawString done");
+
+    // Touch initialisieren
+#ifdef SIMULATION
+    // FT6206 Capacitive Touch via I2C auf D21 (SDA) / D22 (SCL)
+    Wire.begin(21, 22);
+    if (!ctp.begin(40)) {
+        Serial.println("[SIM] FT6206 nicht gefunden!");
+    } else {
+        Serial.println("[SIM] FT6206 OK");
+    }
+#else
     touchSPI.begin(T_CLK, T_MISO, T_MOSI, T_CS);
     ts.begin(touchSPI);
-    ts.setRotation(3);
-
-    // Dimensionen nach setRotation() loggen
-    Serial.printf("Display: %d x %d px\n", tft.width(), tft.height());
+    ts.setRotation(3);  // Hardware: Landscape 180°
+#endif
 
     connectWiFi();
     syncNTP();
 
     tft.fillScreen(TFT_BLACK);
-    tft.drawString("Lade Preise...", 10, 110, 2);
+    tft.drawString("Lade Preise...", 10, 60, 2);
     isFetching = true; drawHeader(); isFetching = false;
 
     fetchPrices();
     lastFetch = millis();
     needsRedraw = true;
+    Serial.println("=== SETUP DONE ===");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -131,6 +171,10 @@ void setup() {
 // ─────────────────────────────────────────────────────────────
 void loop() {
     unsigned long now = millis();
+
+#ifdef SIMULATION
+    lastActivity = now;  // kein Display-Sleep im Simulator
+#endif
 
     // ── Display-Schlaf─Timer ──
     if (displayOn && now - lastActivity >= SLEEP_TIMEOUT) {
@@ -169,6 +213,10 @@ void loop() {
 //  WiFi
 // ─────────────────────────────────────────────────────────────
 void connectWiFi() {
+#ifdef SIMULATION
+    Serial.println("[SIM] WiFi übersprungen");
+    return;
+#endif
     tft.fillScreen(TFT_BLACK);
     tft.drawString("WiFi verbinden...", 10, 110, 2);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -186,6 +234,15 @@ void connectWiFi() {
 //  NTP mit automatischer Sommerzeit (Europe/Vienna)
 // ─────────────────────────────────────────────────────────────
 void syncNTP() {
+#ifdef SIMULATION
+    // Fake-Zeit: 2025-06-15 10:00:00 CEST (UTC+2) = 1749981600 UTC
+    struct timeval tv = { 1749981600L, 0 };
+    settimeofday(&tv, nullptr);
+    setenv("TZ", TZ_VIENNA, 1);
+    tzset();
+    Serial.println("[SIM] Zeit gesetzt: 15.06.2025 10:00 CEST");
+    return;
+#endif
     configTzTime(TZ_VIENNA, NTP1, NTP2);
     struct tm ti;
     int tries = 0;
@@ -200,6 +257,38 @@ void syncNTP() {
 //  API Fetch
 // ─────────────────────────────────────────────────────────────
 bool fetchPrices() {
+#ifdef SIMULATION
+    // Mitternacht des gefakten Tages berechnen
+    time_t now = time(nullptr);
+    struct tm t; localtime_r(&now, &t);
+    t.tm_hour = 0; t.tm_min = 0; t.tm_sec = 0;
+    time_t midnight = mktime(&t);
+
+    // Realistische Österreich-Preise in ct/kWh für 48h
+    const float prices[48] = {
+        // Heute (Stunden 00-23)
+        -2.1f, -1.5f, -0.8f,  0.5f,  1.2f,  2.3f,   // 00-05
+         4.1f,  8.7f, 12.4f, 10.2f,  8.9f,  7.6f,   // 06-11
+         9.0f,  7.2f,  9.1f, 14.3f, 18.7f, 22.1f,   // 12-17
+        19.8f, 15.4f, 12.1f,  9.8f,  7.2f,  4.5f,   // 18-23
+        // Morgen (Stunden 00-23)
+         1.2f, -0.5f, -1.8f, -2.4f, -1.1f,  0.9f,   // 00-05
+         3.7f,  7.8f, 11.2f,  9.4f,  8.1f,  6.9f,   // 06-11
+         7.4f,  8.8f, 11.6f, 16.9f, 21.3f, 25.4f,   // 12-17
+        22.6f, 17.8f, 13.2f, 10.4f,  8.3f,  5.1f    // 18-23
+    };
+
+    slotCount     = 0;
+    tomorrowAvail = false;
+    for (int i = 0; i < 48; i++) {
+        slots[i].ts = midnight + (time_t)(i * 3600);
+        slots[i].ct = prices[i];
+        slotCount++;
+        if (i >= 24) tomorrowAvail = true;
+    }
+    Serial.printf("[SIM] %d Mock-Slots geladen, morgen=%d\n", slotCount, tomorrowAvail);
+    return true;
+#endif
     if (WiFi.status() != WL_CONNECTED) { connectWiFi(); }
     if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -544,34 +633,30 @@ buttons:
 //  TOUCH
 // ─────────────────────────────────────────────────────────────
 void handleTouch() {
+    int tx, ty;
+
+#ifdef SIMULATION
+    // FT6206 Capacitive Touch (I2C)
+    if (!ctp.touched()) return;
+    TS_Point p = ctp.getPoint();
+    // FT6206: Pixel-Koordinaten 0-240 / 0-320, bei Landscape x↔y tauschen
+    tx = map(p.y, 0, 320, 0, SCREEN_W);
+    ty = map(p.x, 240, 0, 0, SCREEN_H);  // invertiert: oben/unten korrigiert
+#else
+    // XPT2046 Resistive Touch (SPI)
     if (!ts.tirqTouched() || !ts.touched()) return;
     TS_Point p = ts.getPoint();
+    tx = map(p.x, 3790, 210, 0, SCREEN_W);
+    ty = map(p.y, 3900, 245, 0, SCREEN_H);
+#endif
 
-    // Display aufwecken falls schlafen
-    if (!displayOn) {
-        if (millis() - sleepTime < 1500) return; // Mindest-Schlafzeit
-        displayOn    = true;
-        lastActivity = millis();
-        digitalWrite(21, HIGH);
-        needsRedraw  = true;
-        delay(200);
-        return;
-    }
-    lastActivity = millis();
-
-    // Kalibrierung aus gemessenen Eckwerten (raw_x: 210–3790, raw_y: 245–3900)
-    int tx = map(p.x, 3790, 210, 0, SCREEN_W);
-    int ty = map(p.y, 3900, 245, 0, SCREEN_H);
     tx = constrain(tx, 0, SCREEN_W - 1);
     ty = constrain(ty, 0, SCREEN_H - 1);
-
     Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", p.x, p.y, tx, ty);
 
 #if TOUCH_DEBUG
-    // Roter Punkt an der berechneten Position zeichnen
     tft.fillCircle(tx, ty, 6, C_RED);
     tft.drawCircle(tx, ty, 7, C_WHITE);
-    // Koordinaten-Label
     char dbgBuf[40];
     sprintf(dbgBuf, "raw(%d,%d)", p.x, p.y);
     tft.fillRect(0, SCREEN_H - FTR_H - 14, 160, 14, C_HDR);
@@ -580,8 +665,8 @@ void handleTouch() {
     sprintf(dbgBuf, "px(%d,%d)", tx, ty);
     tft.fillRect(0, SCREEN_H - FTR_H - 7, 120, 8, C_HDR);
     tft.drawString(dbgBuf, 2, SCREEN_H - FTR_H - 6, 1);
-    delay(500); // laenger warten damit Punkt sichtbar bleibt
-    return;     // im Debug-Modus KEIN normaler Touch-Handler
+    delay(500);
+    return;
 #endif
 
     // Sleep-Button (Header, neben WiFi)

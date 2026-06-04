@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "author": "ESP32-Awattar CYD Emulator",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1",  "id": "esp", "top": 63,    "left": -130, "attrs": {} },
+    { "type": "board-ili9341-cap-touch", "id": "lcd", "top": -184,  "left":  -60, "attrs": {} }
+  ],
+  "connections": [
+    [ "lcd:GND",  "esp:GND.1", "black",  [] ],
+    [ "lcd:VCC",  "esp:VIN",   "red",    [] ],
+    [ "lcd:CS",   "esp:D15",   "orange", [] ],
+    [ "lcd:RST",  "esp:D4",    "blue",   [] ],
+    [ "lcd:D/C",  "esp:D2",    "yellow", [] ],
+    [ "lcd:SCK",  "esp:D18",   "purple", [] ],
+    [ "lcd:MISO", "esp:D19",   "cyan",   [] ],
+    [ "lcd:MOSI", "esp:D23",   "green",  [] ],
+    [ "lcd:SCL",  "esp:D22",   "blue",   [] ],
+    [ "lcd:SDA",  "esp:D21",   "gold",   [] ]
+  ],
+  "serialMonitor": {
+    "display": "auto",
+    "newline": "lf",
+    "baud": 115200
+  }
+}

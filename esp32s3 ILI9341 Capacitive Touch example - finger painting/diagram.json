@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "author": "Tyeth Gundry",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-s3-devkitc-1",
+      "id": "esp32",
+      "top": 38.22,
+      "left": -389.03,
+      "attrs": {}
+    },
+    {
+      "type": "board-ili9341-cap-touch",
+      "id": "lcd1",
+      "top": -184.57,
+      "left": -105.41,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [ "$serialMonitor:RX", "esp32:TX", "", [] ],
+    [ "$serialMonitor:TX", "esp32:RX", "", [] ],
+    [ "lcd1:GND", "esp32:GND.2", "black", [ "v41.37", "h-170.29", "v-76.84" ] ],
+    [ "lcd1:VCC", "esp32:5V", "red", [ "v204.57", "h-373.03", "v-48.04" ] ],
+    [
+      "lcd1:CS",
+      "esp32:15",
+      "yellow",
+      [ "v50.97", "h-134.89", "v-134.4", "h-276.46", "v115.16" ]
+    ],
+    [ "lcd1:SCK", "esp32:12", "blue", [ "v89.37", "h-202.1", "v-19.2" ] ],
+    [ "lcd1:MOSI", "esp32:11", "purple", [ "v222.19", "h-451.19", "v-113.66" ] ],
+    [ "lcd1:D/C", "esp32:2", "orange", [ "v70.17", "h-175.7", "v-67.24" ] ],
+    [ "lcd1:LED", "esp32:6", "green", [ "v214.17", "h-446.55", "v-201.64" ] ],
+    [ "lcd1:SCL", "esp32:8", "blue", [ "v243.21", "h-498.53", "v-173.08" ] ],
+    [ "lcd1:SDA", "esp32:10", "gold", [ "v234.02", "h-493.69", "v-125.49" ] ],
+    [ "lcd1:RST", "esp32:4", "pink", [ "v60.57", "h-154.09", "v-134.4", "h-252.92", "v67.16" ] ],
+    [ "lcd1:MISO", "esp32:13", "green", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}
