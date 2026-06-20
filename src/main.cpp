@@ -1,15 +1,18 @@
 // ============================================================
-//  aWATTar ESP32 Strompreis Monitor
+//  aWATTar ESP32 Strompreis Monitor – LVGL Edition
 //  Board : ESP32-2432S028R (Cheap Yellow Display)
-//  Author: AI-assisted build
+//  UI    : LVGL v8.3
 // ============================================================
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include <lvgl.h>
 #include <time.h>
 #include "secrets.h"
+#include "lv_drivers.h"
+#include "ui.h"
 
 #ifdef SIMULATION
 // ── Simulation: FT6206 Capacitive Touch via I2C (board-ili9341-cap-touch) ──
@@ -30,17 +33,22 @@ XPT2046_Touchscreen ts(T_CS, T_IRQ);
 #endif
 TFT_eSPI           tft;
 
-// ── Konstanten ───────────────────────────────────────────────
+// ── Interner State ────────────────────────────────────────────────────────────
+bool needsFetch = false;  // Touch-Refresh-Button setzt dieses Flag
+
+static lv_obj_t *scr_dashboard = nullptr;
+static lv_obj_t *scr_chart     = nullptr;
+
+TFT_eSPI tft;
+
+// ── Konstanten ────────────────────────────────────────────────────────────────
 const char* AWATTAR_URL = "https://api.awattar.at/v1/marketdata";
-const char* TZ_VIENNA   = "CET-1CEST,M3.5.0,M10.5.0/3";  // auto DST
+const char* TZ_VIENNA   = "CET-1CEST,M3.5.0,M10.5.0/3";
 const char* NTP1        = "pool.ntp.org";
 const char* NTP2        = "at.pool.ntp.org";
 
-// Dynamische Dimensionen – liest echte tft-Werte nach init()+setRotation()
-#define SCREEN_W  (tft.width())
-#define SCREEN_H  (tft.height())
-#define HDR_H      24
-#define FTR_H      26
+#define FETCH_INTERVAL  3600000UL
+#define UPDATE_INTERVAL    1000UL   // UI jede Sekunde aktualisieren
 
 // ── Touch Debug ──────────────────────────────────────────────
 #ifdef SIMULATION
@@ -180,161 +188,87 @@ void setup() {
     Serial.println("=== SETUP DONE ===");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  LOOP
-// ─────────────────────────────────────────────────────────────
-void loop() {
-    unsigned long now = millis();
-
-#ifdef SIMULATION
-    lastActivity = now;  // kein Display-Sleep im Simulator
-#endif
-
-    // ── Display-Schlaf─Timer ──
-    if (displayOn && now - lastActivity >= SLEEP_TIMEOUT) {
-        displayOn     = false;
-        sleepTime     = millis();
-        currentScreen = DASHBOARD;
-        tooltipIdx    = -1;
-        digitalWrite(21, LOW);
-    }
-
-    if (now - lastFetch >= FETCH_INTERVAL) {
-        isFetching = true;
-        fetchPrices();
-        isFetching  = false;
-        lastFetch   = now;
-        needsRedraw = true;
-    }
-
-    if (displayOn && now - lastMinute >= MINUTE_TICK) {
-        lastMinute  = now;
-        needsRedraw = true;
-    }
-
-    handleTouch();
-
-    if (displayOn && needsRedraw) {
-        needsRedraw = false;
-        if (currentScreen == DASHBOARD) drawDashboard();
-        else                             drawChart();
-    }
-
-    delay(50);
+void ui_show_chart() {
+    ui_chart_update(true);  // Standard: Heute
+    lv_scr_load_anim(scr_chart, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  WiFi
-// ─────────────────────────────────────────────────────────────
+// ── WiFi ──────────────────────────────────────────────────────────────────────
 void connectWiFi() {
 #ifdef SIMULATION
     Serial.println("[SIM] WiFi übersprungen");
     return;
 #endif
-    tft.fillScreen(TFT_BLACK);
-    tft.drawString("WiFi verbinden...", 10, 110, 2);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries++ < 40)
-        delay(500);
-
-    if (WiFi.status() == WL_CONNECTED)
-        Serial.printf("WiFi OK: %s\n", WiFi.localIP().toString().c_str());
-    else
-        Serial.println("WiFi FEHLER");
+    while (WiFi.status() != WL_CONNECTED && tries++ < 40) delay(500);
+    Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "FEHLER");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  NTP mit automatischer Sommerzeit (Europe/Vienna)
-// ─────────────────────────────────────────────────────────────
+// ── NTP ───────────────────────────────────────────────────────────────────────
 void syncNTP() {
 #ifdef SIMULATION
-    // Fake-Zeit: 2025-06-15 10:00:00 CEST (UTC+2) = 1749981600 UTC
-    struct timeval tv = { 1749981600L, 0 };
+    struct timeval tv = { 1749981600L, 0 };  // 2025-06-15 10:00 CEST
     settimeofday(&tv, nullptr);
     setenv("TZ", TZ_VIENNA, 1);
     tzset();
-    Serial.println("[SIM] Zeit gesetzt: 15.06.2025 10:00 CEST");
+    Serial.println("[SIM] Zeit: 15.06.2025 10:00 CEST");
     return;
 #endif
     configTzTime(TZ_VIENNA, NTP1, NTP2);
     struct tm ti;
     int tries = 0;
     while (!getLocalTime(&ti) && tries++ < 20) delay(500);
-    if (tries < 20) {
-        char buf[32]; strftime(buf, sizeof(buf), "%H:%M %d.%m.%Y", &ti);
-        Serial.printf("NTP OK: %s\n", buf);
-    }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  API Fetch
-// ─────────────────────────────────────────────────────────────
+// ── API Fetch ─────────────────────────────────────────────────────────────────
 bool fetchPrices() {
 #ifdef SIMULATION
-    // Mitternacht des gefakten Tages berechnen
     time_t now = time(nullptr);
     struct tm t; localtime_r(&now, &t);
     t.tm_hour = 0; t.tm_min = 0; t.tm_sec = 0;
     time_t midnight = mktime(&t);
 
-    // Realistische Österreich-Preise in ct/kWh für 48h
     const float prices[48] = {
-        // Heute (Stunden 00-23)
-        -2.1f, -1.5f, -0.8f,  0.5f,  1.2f,  2.3f,   // 00-05
-         4.1f,  8.7f, 12.4f, 10.2f,  8.9f,  7.6f,   // 06-11
-         9.0f,  7.2f,  9.1f, 14.3f, 18.7f, 22.1f,   // 12-17
-        19.8f, 15.4f, 12.1f,  9.8f,  7.2f,  4.5f,   // 18-23
-        // Morgen (Stunden 00-23)
-         1.2f, -0.5f, -1.8f, -2.4f, -1.1f,  0.9f,   // 00-05
-         3.7f,  7.8f, 11.2f,  9.4f,  8.1f,  6.9f,   // 06-11
-         7.4f,  8.8f, 11.6f, 16.9f, 21.3f, 25.4f,   // 12-17
-        22.6f, 17.8f, 13.2f, 10.4f,  8.3f,  5.1f    // 18-23
+        // Heute
+        -2.1f, -1.5f, -0.8f,  0.5f,  1.2f,  2.3f,
+         4.1f,  8.7f, 12.4f, 10.2f,  8.9f,  7.6f,
+         6.8f,  7.2f,  9.1f, 14.3f, 18.7f, 22.1f,
+        19.8f, 15.4f, 12.1f,  9.8f,  7.2f,  4.5f,
+        // Morgen
+         1.2f, -0.5f, -1.8f, -2.4f, -1.1f,  0.9f,
+         3.7f,  7.8f, 11.2f,  9.4f,  8.1f,  6.9f,
+         5.8f,  6.3f,  8.2f, 13.1f, 16.9f, 20.5f,
+        17.3f, 13.8f, 10.9f,  8.4f,  5.7f,  3.2f,
     };
-
-    slotCount     = 0;
-    tomorrowAvail = false;
+    slotCount = 48;
+    tomorrowAvail = true;
     for (int i = 0; i < 48; i++) {
-        slots[i].ts = midnight + (time_t)(i * 3600);
+        slots[i].ts = midnight + i * 3600;
         slots[i].ct = prices[i];
-        slotCount++;
-        if (i >= 24) tomorrowAvail = true;
     }
-    Serial.printf("[SIM] %d Mock-Slots geladen, morgen=%d\n", slotCount, tomorrowAvail);
+    Serial.println("[SIM] Mock-Preise geladen");
     return true;
-#endif
-    if (WiFi.status() != WL_CONNECTED) { connectWiFi(); }
+#else
+    // ── Echter API-Call ────────────────────────────────────────────────────────
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    // Zeitfenster: heute Mitternacht bis übermorgen Mitternacht
-    struct tm tmNow2; getLocalTime(&tmNow2);
-    tmNow2.tm_hour = 0; tmNow2.tm_min = 0; tmNow2.tm_sec = 0;
-    long long startMs = (long long)mktime(&tmNow2) * 1000LL;
-    long long endMs   = startMs + 172800000LL;  // +48h
-
-    char apiUrl[128];
-    snprintf(apiUrl, sizeof(apiUrl),
-             "%s?start=%lld&end=%lld", AWATTAR_URL, startMs, endMs);
-
     HTTPClient http;
-    http.begin(apiUrl);
+    time_t now = time(nullptr);
+    char url[128];
+    snprintf(url, sizeof(url), "%s?start=%llu000&end=%llu000",
+             AWATTAR_URL, (unsigned long long)(now / 3600 * 3600),
+             (unsigned long long)(now / 3600 * 3600 + 48 * 3600));
+
+    http.begin(url);
     int code = http.GET();
     if (code != 200) { http.end(); return false; }
 
-    String payload = http.getString();
+    JsonDocument doc;
+    if (deserializeJson(doc, http.getStream())) { http.end(); return false; }
     http.end();
 
-    JsonDocument doc;
-    if (deserializeJson(doc, payload)) return false;
-
-    // Heutigen Mitternacht & morgen Mitternacht ermitteln
-    struct tm tmNow; getLocalTime(&tmNow);
-    tmNow.tm_hour = 0; tmNow.tm_min = 0; tmNow.tm_sec = 0;
-    time_t todayMid    = mktime(&tmNow);
-    time_t tomorrowMid = todayMid + 86400;
-    time_t dayAfter    = todayMid + 172800;
-
-    slotCount     = 0;
+    slotCount = 0;
     tomorrowAvail = false;
 
     for (JsonObject e : doc["data"].as<JsonArray>()) {
@@ -523,134 +457,34 @@ void drawChart() {
     }
 
     {
-        // Min / Max / Avg
-        float minP = view[0]->ct, maxP = view[0]->ct, sum = 0;
-        for (int i = 0; i < cnt; i++) {
-            if (view[i]->ct < minP) minP = view[i]->ct;
-            if (view[i]->ct > maxP) maxP = view[i]->ct;
-            sum += view[i]->ct;
-        }
-        float avg = sum / cnt;
-
-        // Feste Y-Achse in 5ct-Schritten (inkl. 0 wenn nötig)
-        float yMin   = floorf(min(minP, 0.0f) / 5.0f) * 5.0f;
-        float yMax   = ceilf(maxP / 5.0f) * 5.0f;
-        if (yMax <= yMin) yMax = yMin + 5.0f;
-        float yRange = yMax - yMin;
-
-        // Y-Achse: Grid-Linien + Labels alle 5ct
-        char yb[8];
-        for (float yv = yMin; yv <= yMax + 0.1f; yv += 5.0f) {
-            int yPx = CY + CH - (int)((yv - yMin) / yRange * CH);
-            if (yPx < CY || yPx > CY + CH) continue;
-            uint16_t gc = (fabsf(yv) < 0.1f) ? C_YELLOW : C_GRAY;
-            for (int x = CX; x < CX + CW; x += 8) tft.drawPixel(x, yPx, gc);
-            sprintf(yb, "%d", (int)yv);
-            tft.setTextColor(gc, C_BG);
-            tft.drawString(yb, 0, yPx - 4, 1);
-        }
-
-        // Balken
-        float bw = (float)CW / cnt;
-        time_t nowT = time(nullptr);
-        struct tm* tmN = localtime(&nowT);
-        int curHour = tmN->tm_hour;
-        int curMin  = tmN->tm_min;
-
-        for (int i = 0; i < cnt; i++) {
-            float pr  = view[i]->ct;
-            int   bh  = max(2, (int)((pr - yMin) / yRange * CH));
-            int   bx  = CX + (int)(i * bw);
-            int   by  = CY + CH - bh;
-            int   bwi = max(1, (int)bw - 1);
-
-            uint16_t col     = barColor(pr);
-            uint16_t fillCol = col;
-            if (i == tooltipIdx) {
-                uint8_t r = min(31, ((col >> 11) & 0x1F) + 8);
-                uint8_t g = min(63, ((col >> 5)  & 0x3F) + 16);
-                uint8_t b = min(31, (col & 0x1F) + 8);
-                fillCol = ((uint16_t)r << 11) | ((uint16_t)g << 5) | b;
-            }
-            tft.fillRect(bx, by, bwi, bh, fillCol);
-
-            struct tm* st = localtime(&view[i]->ts);
-            if (showToday && st->tm_hour == curHour)
-                tft.drawRect(bx - 1, by - 1, bwi + 2, bh + 2, C_WHITE);
-            if (i == tooltipIdx)
-                tft.drawRect(bx - 1, by - 1, bwi + 2, bh + 2, C_YELLOW);
-
-            if (i % 4 == 0) {
-                char hb[3]; sprintf(hb, "%02d", st->tm_hour);
-                tft.setTextColor(C_GRAY, C_BG);
-                tft.drawString(hb, bx, CY + CH + 2, 1);
-            }
-        }
-
-        // Aktuelle Zeit: senkrechter Cyan-Strich (heute, auf 15 min gerundet)
-        if (showToday) {
-            for (int i = 0; i < cnt; i++) {
-                struct tm* si = localtime(&view[i]->ts);
-                if (si->tm_hour == curHour) {
-                    int bx   = CX + (int)(i * bw);
-                    int qMin = (curMin / 15) * 15;
-                    int nowX = bx + (int)(qMin / 60.0f * bw);
-                    for (int y = CY; y < CY + CH; y += 4)
-                        tft.drawFastVLine(nowX, y, 2, C_CYAN);
-                    break;
-                }
-            }
-        }
-
-        // Durchschnitts-Linie (gestrichelt weiß)
-        int avgY = CY + CH - (int)((avg - yMin) / yRange * CH);
-        for (int x = CX; x < CX + CW; x += 6)
-            tft.drawFastHLine(x, avgY, 3, C_WHITE);
-        char avgb[12]; sprintf(avgb, "o%.1f", avg);
-        tft.setTextColor(C_WHITE, C_BG);
-        tft.drawString(avgb, CX + CW - 34, avgY - 7, 1);
-
-        // Tooltip
-        if (tooltipIdx >= 0 && tooltipIdx < cnt) {
-            struct tm* st = localtime(&view[tooltipIdx]->ts);
-            char ttb[32];
-            sprintf(ttb, "%02d-%02dh: %.1f ct",
-                    st->tm_hour, (st->tm_hour + 1) % 24,
-                    view[tooltipIdx]->ct);
-            tft.fillRect(CX, CY, 200, 13, C_HDR);
-            tft.setTextColor(C_YELLOW, C_HDR);
-            tft.drawString(ttb, CX + 2, CY + 2, 1);
-        }
+        struct tm t2; localtime_r(&now, &t2);
+        t2.tm_hour = 0; t2.tm_min = 0; t2.tm_sec = 0;
+        today_midnight = mktime(&t2);
     }
 
-buttons:
-    // ── Footer-Buttons ───────────────────────────────────────
-    tft.fillRect(0, SCREEN_H - FTR_H, SCREEN_W, FTR_H, C_HDR);
-
-    // [Heute]
-    uint16_t hCol = showToday ? C_WHITE : C_GRAY;
-    tft.drawRect(2, SCREEN_H - FTR_H + 2, 70, 22, hCol);
-    tft.setTextColor(hCol, C_HDR);
-    tft.drawString("Heute", 14, SCREEN_H - FTR_H + 7, 2);
-
-    // [Morgen]
-    uint16_t mCol = tomorrowAvail ? (!showToday ? C_WHITE : C_GRAY) : C_GRAY;
-    tft.drawRect(76, SCREEN_H - FTR_H + 2, 76, 22, mCol);
-    tft.setTextColor(mCol, C_HDR);
-    tft.drawString("Morgen", 84, SCREEN_H - FTR_H + 7, 2);
-
-    // [Zurück]
-    tft.drawRect(156, SCREEN_H - FTR_H + 2, 80, 22, C_CYAN);
-    tft.setTextColor(C_CYAN, C_HDR);
-    tft.drawString("< Zurueck", 160, SCREEN_H - FTR_H + 7, 2);
+    for (JsonObject item : doc["data"].as<JsonArray>()) {
+        if (slotCount >= MAX_SLOTS) break;
+        time_t ts = (time_t)(item["start_timestamp"].as<long long>() / 1000);
+        float ct  = item["marketprice"].as<float>() / 10.0f;
+        slots[slotCount++] = { ts, ct };
+        if (ts >= today_midnight + 24 * 3600) tomorrowAvail = true;
+    }
+    return slotCount > 0;
+#endif
 }
 
-// ─────────────────────────────────────────────────────────────
-//  TOUCH
-// ─────────────────────────────────────────────────────────────
-void handleTouch() {
-    int tx, ty;
+// ── Setup ─────────────────────────────────────────────────────────────────────
+void setup() {
+    Serial.begin(115200);
+    Serial.println("=== aWATTar LVGL Start ===");
 
+#ifndef SIMULATION
+    pinMode(21, OUTPUT);
+    digitalWrite(21, HIGH);  // Backlight an
+#endif
+
+    // Display init
+    tft.init();
 #ifdef SIMULATION
     // FT6206 Capacitive Touch (I2C)
     if (!ctpAvailable || !ctp.touched()) return;
@@ -681,87 +515,52 @@ void handleTouch() {
     ty = constrain(ty, 0, SCREEN_H - 1);
     Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", p.x, p.y, tx, ty);
 
-#if TOUCH_DEBUG
-    tft.fillCircle(tx, ty, 6, C_RED);
-    tft.drawCircle(tx, ty, 7, C_WHITE);
-    char dbgBuf[40];
-    sprintf(dbgBuf, "raw(%d,%d)", p.x, p.y);
-    tft.fillRect(0, SCREEN_H - FTR_H - 14, 160, 14, C_HDR);
-    tft.setTextColor(C_YELLOW, C_HDR);
-    tft.drawString(dbgBuf, 2, SCREEN_H - FTR_H - 13, 1);
-    sprintf(dbgBuf, "px(%d,%d)", tx, ty);
-    tft.fillRect(0, SCREEN_H - FTR_H - 7, 120, 8, C_HDR);
-    tft.drawString(dbgBuf, 2, SCREEN_H - FTR_H - 6, 1);
-    delay(500);
-    return;
-#endif
+    // Screens erstellen
+    scr_dashboard = lv_obj_create(nullptr);
+    scr_chart     = lv_obj_create(nullptr);
 
-    // Sleep-Button (Header, neben WiFi)
-    if (ty < HDR_H && tx > SCREEN_W - 52 && tx < SCREEN_W - 32) {
-        displayOn = !displayOn;
-        if (displayOn) {
-            lastActivity = millis();
-            digitalWrite(21, HIGH);
-            needsRedraw = true;
-        } else {
-            sleepTime     = millis();
-            currentScreen = DASHBOARD;
-            tooltipIdx    = -1;
-            digitalWrite(21, LOW);
-        }
-        return;
-    }
+    ui_dashboard_create(scr_dashboard);
+    ui_chart_create(scr_chart);
 
-    delay(200); // Entprellen
+    // Dashboard als Start-Screen laden
+    lv_scr_load(scr_dashboard);
 
-    if (currentScreen == DASHBOARD) {
-        // Refresh-Button (oben rechts)
-        if (tx > SCREEN_W - 50 && ty > HDR_H && ty < HDR_H + 22) {
-            isFetching = true; needsRedraw = true;
-            if (currentScreen == DASHBOARD) drawHeader();
-            fetchPrices();
-            isFetching = false;
-            lastFetch  = millis();
-            needsRedraw = true;
-            return;
-        }
-        // Hauptfläche → Chart
-        if (ty > HDR_H && ty < SCREEN_H - FTR_H) {
-            currentScreen = CHART;
-            tooltipIdx    = -1;
-            needsRedraw   = true;
-        }
+    // WiFi + Zeit + erste Preise holen
+    connectWiFi();
+    syncNTP();
+    isFetching = true; lvgl_update();
+    fetchPrices();
+    isFetching  = false;
+    lastFetch   = millis();
 
-    } else { // CHART
-        int btnY = SCREEN_H - FTR_H;
+    ui_dashboard_update();
+    Serial.println("=== SETUP DONE ===");
+}
 
-        // Buttons
-        if (ty >= btnY) {
-            if (tx < 72) {                        // Heute
-                showToday = true; tooltipIdx = -1; needsRedraw = true;
-            } else if (tx < 152) {                // Morgen
-                if (tomorrowAvail) {
-                    showToday = false; tooltipIdx = -1; needsRedraw = true;
-                } else {
-                    showToast("Morgen noch nicht verfuegbar");
-                }
-            } else if (tx >= 156) {               // Zurück
-                currentScreen = DASHBOARD; needsRedraw = true;
-            }
-            return;
-        }
+// ── Loop ──────────────────────────────────────────────────────────────────────
+void loop() {
+    unsigned long now = millis();
 
-        // Balken antippen → Tooltip
-        const int CX = 28;
-        const int CW = SCREEN_W - CX - 4;
-        HourSlot* view[24]; int cnt = 0;
-        getFilteredSlots(view, cnt);
-        if (cnt > 0 && tx >= CX) {
-            int idx = (int)((tx - CX) / ((float)CW / cnt));
-            if (idx >= 0 && idx < cnt) {
-                tooltipIdx = (tooltipIdx == idx) ? -1 : idx; // Toggle
-                needsRedraw = true;
-            }
+    // LVGL Tasks (Touch + Redraw)
+    lvgl_update();
+
+    // UI jede Sekunde aktualisieren (Zeit, Preis)
+    if (now - lastUpdate >= UPDATE_INTERVAL) {
+        lastUpdate = now;
+        if (lv_scr_act() == scr_dashboard) {
+            ui_dashboard_update();
         }
     }
+
+    // Stündlicher Fetch
+    if (now - lastFetch >= FETCH_INTERVAL || needsFetch) {
+        needsFetch  = false;
+        isFetching  = true;
+        fetchPrices();
+        isFetching  = false;
+        lastFetch   = now;
+        ui_dashboard_update();
+    }
+
+    delay(5);  // LVGL braucht ~5ms Tick-Auflösung
 }
