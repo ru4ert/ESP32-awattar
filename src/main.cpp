@@ -16,6 +16,7 @@
 #include <Wire.h>
 #include <Adafruit_FT6206.h>
 Adafruit_FT6206 ctp;
+bool ctpAvailable = false;
 #else
 // ── Hardware: XPT2046 Resistive Touch via SPI ────────────────────────────────
 #include <XPT2046_Touchscreen.h>
@@ -43,9 +44,9 @@ const char* NTP2        = "at.pool.ntp.org";
 
 // ── Touch Debug ──────────────────────────────────────────────
 #ifdef SIMULATION
-#define TOUCH_DEBUG  0   // Koordinaten OK, jetzt echte Touch-Events
+#define TOUCH_DEBUG  0
 #else
-#define TOUCH_DEBUG  0   // Hardware: normal
+#define TOUCH_DEBUG  0   // Kalibrierung abgeschlossen
 #endif
 
 #define FETCH_INTERVAL 3600000UL   // 1 h in ms
@@ -106,9 +107,20 @@ void setup() {
     Serial.begin(115200);
     Serial.println("=== SETUP START ===");
 
-    // Backlight
+    // Backlight – NUR auf echter Hardware, nicht im Simulator!
+    // Im Simulator ist GPIO21 = SDA (I2C für FT6206 Touch)
+#ifndef SIMULATION
     pinMode(21, OUTPUT);
     digitalWrite(21, HIGH);
+#endif
+
+#ifdef SIMULATION
+    // ── I2C MUSS vor tft.init() initialisiert werden! (Wokwi requirement) ──
+    // FT6206 I2C auf D21 (SDA) / D22 (SCL)
+    Wire.begin(21, 22);
+    delay(50);
+    Serial.println("[SIM] Wire.begin(21,22) done");
+#endif
 
     // Display
     Serial.println("tft.init()...");
@@ -118,7 +130,8 @@ void setup() {
 #ifdef SIMULATION
     tft.setRotation(1);   // ILI9341 Landscape (standard, Wokwi-kompatibel)
 #else
-    tft.setRotation(3);   // Hardware: Landscape 180° (USB links)
+    tft.setRotation(0);   // Hardware: Landscape (CYD HW-458)
+    tft.fillScreen(TFT_BLACK);  // Residual VRAM löschen (ILI9341 Quirk)
 #endif
 
     Serial.printf("Display: %d x %d px\n", tft.width(), tft.height());
@@ -140,17 +153,17 @@ void setup() {
 
     // Touch initialisieren
 #ifdef SIMULATION
-    // FT6206 Capacitive Touch via I2C auf D21 (SDA) / D22 (SCL)
-    Wire.begin(21, 22);
-    if (!ctp.begin(40)) {
-        Serial.println("[SIM] FT6206 nicht gefunden!");
+    // FT6206 auf I2C (Wire wurde bereits oben gestartet)
+    ctpAvailable = ctp.begin(40);
+    if (!ctpAvailable) {
+        Serial.println("[SIM] FT6206 nicht gefunden - Touch deaktiviert");
     } else {
         Serial.println("[SIM] FT6206 OK");
     }
 #else
     touchSPI.begin(T_CLK, T_MISO, T_MOSI, T_CS);
     ts.begin(touchSPI);
-    ts.setRotation(3);  // Hardware: Landscape 180°
+    ts.setRotation(0);  // Hardware: test rotation 0
 #endif
 
     connectWiFi();
@@ -161,8 +174,9 @@ void setup() {
     isFetching = true; drawHeader(); isFetching = false;
 
     fetchPrices();
-    lastFetch = millis();
-    needsRedraw = true;
+    lastFetch    = millis();
+    lastActivity = millis();  // FIX: verhindert sofortigen Display-Sleep nach Boot
+    needsRedraw  = true;
     Serial.println("=== SETUP DONE ===");
 }
 
@@ -495,6 +509,8 @@ void drawChart() {
     const int CX = 28, CY = HDR_H + 8;
     const int CW = SCREEN_W - CX - 4;
     const int CH = SCREEN_H - HDR_H - FTR_H - 20;
+    // Rechten Rand explizit löschen (ILI9341 zeigt manchmal Artefakte)
+    tft.fillRect(CX + CW, CY, SCREEN_W - (CX + CW), CH, C_BG);
 
     // Slots holen
     HourSlot* view[24]; int cnt = 0;
@@ -637,7 +653,7 @@ void handleTouch() {
 
 #ifdef SIMULATION
     // FT6206 Capacitive Touch (I2C)
-    if (!ctp.touched()) return;
+    if (!ctpAvailable || !ctp.touched()) return;
     TS_Point p = ctp.getPoint();
     // FT6206: Pixel-Koordinaten 0-240 / 0-320, bei Landscape x↔y tauschen
     tx = map(p.y, 0, 320, 0, SCREEN_W);
@@ -646,9 +662,20 @@ void handleTouch() {
     // XPT2046 Resistive Touch (SPI)
     if (!ts.tirqTouched() || !ts.touched()) return;
     TS_Point p = ts.getPoint();
-    tx = map(p.x, 3790, 210, 0, SCREEN_W);
-    ty = map(p.y, 3900, 245, 0, SCREEN_H);
+    tx = map(p.y, 245, 3900, 0, SCREEN_W);   // raw.Y → screen.X (links/rechts)
+    ty = map(p.x, 3790, 210, 0, SCREEN_H);   // raw.X → screen.Y (oben/unten, invertiert)
 #endif
+
+    // FIX: lastActivity bei JEDEM Touch aktualisieren (auch bei raw(0,0))
+    lastActivity = millis();
+
+    // Display aufwecken falls es schläft
+    if (!displayOn) {
+        displayOn   = true;
+        digitalWrite(21, HIGH);
+        needsRedraw = true;
+        return;  // erstes Touch nur zum Aufwecken
+    }
 
     tx = constrain(tx, 0, SCREEN_W - 1);
     ty = constrain(ty, 0, SCREEN_H - 1);
