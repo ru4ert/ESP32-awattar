@@ -14,8 +14,10 @@
    Farbtiefe
  *====================*/
 #define LV_COLOR_DEPTH 16
-/* RGB565 Byte-Swap für TFT_eSPI nötig */
-#define LV_COLOR_16_SWAP 1
+/* Kein Byte-Swap: der Flush-Callback nutzt pushColors(..., swap=true),
+ * TFT_eSPI erledigt den Swap also selbst. SWAP=1 + swap=true wäre doppelt
+ * getauscht → falsche Farben. */
+#define LV_COLOR_16_SWAP 0
 
 /*====================
    Speicher
@@ -124,15 +126,19 @@
 /*====================
    Fonts
  *====================*/
+/* Built-in Montserrat nur für den großen Preis (reine Ziffern/ASCII).
+ * Für alle Textgrößen (12/14/16) werden eigene Fonts mit deutschen Umlauten,
+ * Ø, € + LVGL-Symbolen verwendet: src/fonts/lv_font_montserrat_de_*.c
+ * (generiert mit lv_font_conv, Kommando steht im Font-File-Header). */
 #define LV_FONT_MONTSERRAT_8  0
 #define LV_FONT_MONTSERRAT_10 0
-#define LV_FONT_MONTSERRAT_12 1
-#define LV_FONT_MONTSERRAT_14 1
-#define LV_FONT_MONTSERRAT_16 1
+#define LV_FONT_MONTSERRAT_12 0
+#define LV_FONT_MONTSERRAT_14 0
+#define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
-#define LV_FONT_MONTSERRAT_20 1
+#define LV_FONT_MONTSERRAT_20 0
 #define LV_FONT_MONTSERRAT_22 0
-#define LV_FONT_MONTSERRAT_24 1
+#define LV_FONT_MONTSERRAT_24 0
 #define LV_FONT_MONTSERRAT_26 0
 #define LV_FONT_MONTSERRAT_28 0
 #define LV_FONT_MONTSERRAT_30 0
@@ -146,7 +152,12 @@
 #define LV_FONT_MONTSERRAT_46 0
 #define LV_FONT_MONTSERRAT_48 1
 
-#define LV_FONT_DEFAULT &lv_font_montserrat_14
+#define LV_FONT_CUSTOM_DECLARE \
+    LV_FONT_DECLARE(lv_font_montserrat_de_12) \
+    LV_FONT_DECLARE(lv_font_montserrat_de_14) \
+    LV_FONT_DECLARE(lv_font_montserrat_de_16)
+
+#define LV_FONT_DEFAULT &lv_font_montserrat_de_14
 
 #define LV_FONT_UNSCII_8  0
 #define LV_FONT_UNSCII_16 0

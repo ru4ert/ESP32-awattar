@@ -19,13 +19,35 @@
 static lv_obj_t *scr_chart      = nullptr;
 static lv_obj_t *lbl_chart_hdr  = nullptr;
 static lv_obj_t *chart_obj      = nullptr;
+static lv_obj_t *btn_tmrw       = nullptr;
 static lv_chart_series_t *ser   = nullptr;
 static bool _showToday           = true;
+
+bool ui_chart_is_today() { return _showToday; }
 
 // ── Event Callbacks ───────────────────────────────────────────────────────────
 static void cb_back(lv_event_t *e)  { ui_show_dashboard(); }
 static void cb_today(lv_event_t *e) { ui_chart_update(true);  }
-static void cb_tomorrow(lv_event_t *e) { ui_chart_update(false); }
+static void cb_tomorrow(lv_event_t *e) {
+    if (!tomorrowAvail) return;  // Daten kommen meist erst ab ~14:00
+    ui_chart_update(false);
+}
+
+// ── Tooltip: Tap auf Balken zeigt Stunde + Preis im Header ───────────────────
+static void chart_pressed_event(lv_event_t *e) {
+    uint32_t id = lv_chart_get_pressed_point(chart_obj);
+    if (id == LV_CHART_POINT_NONE) return;
+
+    int i = (int)id + (_showToday ? 0 : 24);
+    if (i >= slotCount) return;
+
+    struct tm st; localtime_r(&slots[i].ts, &st);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%02d-%02d Uhr: %.1f ct",
+             st.tm_hour, (st.tm_hour + 1) % 24, slots[i].ct);
+    lv_label_set_text(lbl_chart_hdr, buf);
+    lv_obj_set_style_text_color(lbl_chart_hdr, price_color(slots[i].ct), 0);
+}
 
 // ── Draw-Event für farbige Balken ─────────────────────────────────────────────
 static void chart_draw_event(lv_event_t *e) {
@@ -41,11 +63,10 @@ static void chart_draw_event(lv_event_t *e) {
     lv_color_t col = price_color(ct);
     dsc->rect_dsc->bg_color = col;
 
-    // Aktuelle Stunde hervorheben
+    // Aktuelle Stunde hervorheben (nur in der Heute-Ansicht sinnvoll)
     time_t now = time(nullptr);
     struct tm t; localtime_r(&now, &t);
-    if (!_showToday) t.tm_mday--;  // Morgen → Heute-Offset
-    if (dsc->id == t.tm_hour) {
+    if (_showToday && dsc->id == t.tm_hour) {
         dsc->rect_dsc->border_color = UI_COLOR_WHITE;
         dsc->rect_dsc->border_width = 2;
     }
@@ -68,7 +89,7 @@ void ui_chart_create(lv_obj_t *parent) {
     lv_obj_set_style_pad_all(hdr, 0, 0);
 
     lbl_chart_hdr = lv_label_create(hdr);
-    lv_obj_set_style_text_font(lbl_chart_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl_chart_hdr, &lv_font_montserrat_de_16, 0);
     lv_obj_set_style_text_color(lbl_chart_hdr, UI_COLOR_WHITE, 0);
     lv_obj_align(lbl_chart_hdr, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(lbl_chart_hdr, "HEUTE");
@@ -93,6 +114,8 @@ void ui_chart_create(lv_obj_t *parent) {
     ser = lv_chart_add_series(chart_obj, UI_COLOR_GREEN, LV_CHART_AXIS_PRIMARY_Y);
 
     lv_obj_add_event_cb(chart_obj, chart_draw_event, LV_EVENT_DRAW_PART_BEGIN, nullptr);
+    lv_obj_add_event_cb(chart_obj, chart_pressed_event, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(chart_obj, chart_pressed_event, LV_EVENT_PRESSING, nullptr);
 
     // ─── Footer ───────────────────────────────────────────────────────────────
     lv_obj_t *ftr = lv_obj_create(scr_chart);
@@ -112,7 +135,7 @@ void ui_chart_create(lv_obj_t *parent) {
     lv_obj_set_style_radius(btn_back, 4, 0);
     lv_obj_add_event_cb(btn_back, cb_back, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *btn_back_lbl = lv_label_create(btn_back);
-    lv_obj_set_style_text_font(btn_back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(btn_back_lbl, &lv_font_montserrat_de_12, 0);
     lv_label_set_text(btn_back_lbl, LV_SYMBOL_LEFT " Dashboard");
     lv_obj_align(btn_back_lbl, LV_ALIGN_CENTER, 0, 0);
 
@@ -124,18 +147,18 @@ void ui_chart_create(lv_obj_t *parent) {
     lv_obj_set_style_radius(btn_today, 4, 0);
     lv_obj_add_event_cb(btn_today, cb_today, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *lbl_today = lv_label_create(btn_today);
-    lv_obj_set_style_text_font(lbl_today, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lbl_today, &lv_font_montserrat_de_12, 0);
     lv_label_set_text(lbl_today, "Heute");
     lv_obj_align(lbl_today, LV_ALIGN_CENTER, 0, 0);
 
-    lv_obj_t *btn_tmrw = lv_btn_create(ftr);
+    btn_tmrw = lv_btn_create(ftr);
     lv_obj_set_size(btn_tmrw, 58, 22);
     lv_obj_align(btn_tmrw, LV_ALIGN_RIGHT_MID, -2, 0);
     lv_obj_set_style_bg_color(btn_tmrw, lv_color_hex(0x1B5E20), 0);
     lv_obj_set_style_radius(btn_tmrw, 4, 0);
     lv_obj_add_event_cb(btn_tmrw, cb_tomorrow, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *lbl_tmrw = lv_label_create(btn_tmrw);
-    lv_obj_set_style_text_font(lbl_tmrw, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lbl_tmrw, &lv_font_montserrat_de_12, 0);
     lv_label_set_text(lbl_tmrw, "Morgen");
     lv_obj_align(lbl_tmrw, LV_ALIGN_CENTER, 0, 0);
 }
@@ -145,14 +168,41 @@ void ui_chart_update(bool showToday) {
     if (!chart_obj || !ser) return;
     _showToday = showToday;
 
-    lv_label_set_text(lbl_chart_hdr, showToday ? "HEUTE" : "MORGEN");
-
     int offset = showToday ? 0 : 24;
     lv_chart_set_all_value(chart_obj, ser, LV_CHART_POINT_NONE);
 
+    float mn = 0.0f, mx = 5.0f, sum = 0.0f;
+    int   cnt = 0;
     for (int i = 0; i < 24 && (offset + i) < slotCount; i++) {
-        int val = (int)(slots[offset + i].ct * 100);
-        ser->y_points[i] = val;
+        float ct = slots[offset + i].ct;
+        ser->y_points[i] = (int)(ct * 100);
+        if (ct < mn) mn = ct;
+        if (ct > mx) mx = ct;
+        sum += ct; cnt++;
     }
+
+    // Y-Achse dynamisch in 5-ct-Schritten (0 immer enthalten, kein Clipping >30 ct)
+    int lo = (int)(floorf(mn / 5.0f) * 500.0f);
+    int hi = (int)(ceilf (mx / 5.0f) * 500.0f);
+    if (hi <= lo) hi = lo + 500;
+    lv_chart_set_range(chart_obj, LV_CHART_AXIS_PRIMARY_Y, lo, hi);
+
+    // Header: Ansicht + Tagesdurchschnitt (Ø kommt aus dem neuen DE-Font)
+    char hdr[48];
+    if (cnt > 0)
+        snprintf(hdr, sizeof(hdr), "%s   Ø %.1f ct",
+                 showToday ? "HEUTE" : "MORGEN", sum / cnt);
+    else
+        snprintf(hdr, sizeof(hdr), "%s   keine Daten",
+                 showToday ? "HEUTE" : "MORGEN");
+    lv_label_set_text(lbl_chart_hdr, hdr);
+    lv_obj_set_style_text_color(lbl_chart_hdr, UI_COLOR_WHITE, 0);
+
+    // Morgen-Button ausgrauen solange die API noch keine Daten liefert
+    if (btn_tmrw) {
+        if (tomorrowAvail) lv_obj_clear_state(btn_tmrw, LV_STATE_DISABLED);
+        else               lv_obj_add_state(btn_tmrw, LV_STATE_DISABLED);
+    }
+
     lv_chart_refresh(chart_obj);
 }

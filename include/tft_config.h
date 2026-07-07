@@ -29,6 +29,13 @@
 #define TFT_DC     2
 #define TFT_RST   -1   // Reset nicht verwendet
 #define TFT_BL    21   // Backlight
+
+// ACHTUNG Panel-Quirk: Das verbaute Panel ist ein Clone, dessen MADCTL-Bits
+// (Rotation/Spiegelung/Farbreihenfolge) und Invertierung nicht der ILI9341-
+// Norm entsprechen. Deshalb werden Rotation, Invertierung und R/B-Reihenfolge
+// NICHT hier zur Compile-Zeit gesetzt, sondern zur Laufzeit über den
+// Kalibrier-Screen (Zahnrad im Dashboard) konfiguriert und im NVS gespeichert.
+// Siehe display_apply() in src/lv_drivers.cpp.
 #endif
 
 // ── Touch (XPT2046 auf VSPI) ─────────────────────────────────────────────────

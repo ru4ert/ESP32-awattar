@@ -14,6 +14,14 @@ extern int       slotCount;
 extern bool      tomorrowAvail;
 extern bool      isFetching;
 
+// Strommix (energy-charts.info): Anteil Erneuerbare in % an der Erzeugung
+extern int       renewShare;
+extern bool      renewValid;
+
+// Emoji-Bilder (echte Farb-Emojis als RGB565-Bitmaps, src/img/)
+LV_IMG_DECLARE(img_emoji_battery);   // 🔋 erneuerbar
+LV_IMG_DECLARE(img_emoji_oil);       // 🛢 fossil
+
 // ── Farb-Palette (LVGL lv_color_hex) ─────────────────────────────────────────
 #define UI_COLOR_BG       lv_color_hex(0x0D1B2A)   // Dunkelblau
 #define UI_COLOR_HDR      lv_color_hex(0x1B2A3B)   // Etwas heller
@@ -42,7 +50,11 @@ void ui_dashboard_update();   // Daten aktualisieren (nach Fetch)
 
 void ui_chart_create(lv_obj_t *parent);
 void ui_chart_update(bool showToday);
+bool ui_chart_is_today();     // aktuelle Chart-Ansicht (für Refresh nach Fetch)
+
+void ui_setup_create(lv_obj_t *parent);   // Display-Kalibrierung
 
 // ── Haupt-Screen wechseln ─────────────────────────────────────────────────────
 void ui_show_dashboard();
 void ui_show_chart();
+void ui_show_setup();

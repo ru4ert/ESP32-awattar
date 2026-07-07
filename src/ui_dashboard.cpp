@@ -18,20 +18,26 @@
  */
 #include "ui.h"
 #include <Arduino.h>
+#include <WiFi.h>
 
 // ── Widgets (persistent) ──────────────────────────────────────────────────────
 static lv_obj_t *scr_dash   = nullptr;
 static lv_obj_t *lbl_time   = nullptr;
 static lv_obj_t *lbl_date   = nullptr;
+static lv_obj_t *lbl_wifi   = nullptr;
 static lv_obj_t *lbl_fetch  = nullptr;
+static lv_obj_t *lbl_status = nullptr;
 static lv_obj_t *lbl_price  = nullptr;
 static lv_obj_t *lbl_unit   = nullptr;
 static lv_obj_t *bar_price  = nullptr;
 static lv_obj_t *lbl_trend  = nullptr;
 static lv_obj_t *list_next  = nullptr;
+static lv_obj_t *img_energy = nullptr;
+static lv_obj_t *lbl_energy = nullptr;
 
 // ── Event Callbacks ───────────────────────────────────────────────────────────
 static void cb_chart(lv_event_t *e) { ui_show_chart(); }
+static void cb_setup(lv_event_t *e) { ui_show_setup(); }
 static void cb_fetch(lv_event_t *e) {
     extern bool needsFetch;
     needsFetch = true;
@@ -67,24 +73,42 @@ void ui_dashboard_create(lv_obj_t *parent) {
     lv_obj_set_style_radius(hdr, 0, 0);
 
     lbl_time = lv_label_create(hdr);
-    lv_obj_set_style_text_font(lbl_time, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl_time, &lv_font_montserrat_de_16, 0);
     lv_obj_set_style_text_color(lbl_time, UI_COLOR_WHITE, 0);
     lv_obj_align(lbl_time, LV_ALIGN_LEFT_MID, 6, 0);
     lv_label_set_text(lbl_time, "00:00");
 
     lbl_date = lv_label_create(hdr);
-    lv_obj_set_style_text_font(lbl_date, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lbl_date, &lv_font_montserrat_de_12, 0);
     lv_obj_set_style_text_color(lbl_date, UI_COLOR_SILVER, 0);
     lv_obj_align(lbl_date, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(lbl_date, "01.01.2025");
 
     lbl_fetch = lv_label_create(hdr);
-    lv_obj_set_style_text_font(lbl_fetch, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl_fetch, &lv_font_montserrat_de_16, 0);
     lv_obj_set_style_text_color(lbl_fetch, UI_COLOR_CYAN, 0);
     lv_obj_align(lbl_fetch, LV_ALIGN_RIGHT_MID, -6, 0);
     lv_label_set_text(lbl_fetch, LV_SYMBOL_REFRESH);
     lv_obj_add_flag(lbl_fetch, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(lbl_fetch, 8);  // Stift trifft leichter
     lv_obj_add_event_cb(lbl_fetch, cb_fetch, LV_EVENT_CLICKED, nullptr);
+
+    // WLAN-Status (Farbe = Empfangsqualität)
+    lbl_wifi = lv_label_create(hdr);
+    lv_obj_set_style_text_font(lbl_wifi, &lv_font_montserrat_de_16, 0);
+    lv_obj_set_style_text_color(lbl_wifi, UI_COLOR_SILVER, 0);
+    lv_obj_align(lbl_wifi, LV_ALIGN_RIGHT_MID, -34, 0);
+    lv_label_set_text(lbl_wifi, LV_SYMBOL_WIFI);
+
+    // Zahnrad → Display-Kalibrierung
+    lv_obj_t *lbl_gear = lv_label_create(hdr);
+    lv_obj_set_style_text_font(lbl_gear, &lv_font_montserrat_de_16, 0);
+    lv_obj_set_style_text_color(lbl_gear, UI_COLOR_SILVER, 0);
+    lv_obj_align(lbl_gear, LV_ALIGN_RIGHT_MID, -62, 0);
+    lv_label_set_text(lbl_gear, LV_SYMBOL_SETTINGS);
+    lv_obj_add_flag(lbl_gear, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(lbl_gear, 8);
+    lv_obj_add_event_cb(lbl_gear, cb_setup, LV_EVENT_CLICKED, nullptr);
 
     // ─── Linke Spalte: Aktueller Preis ────────────────────────────────────────
     lv_obj_t *card_now = lv_obj_create(scr_dash);
@@ -98,10 +122,17 @@ void ui_dashboard_create(lv_obj_t *parent) {
     lv_obj_set_style_pad_all(card_now, 8, 0);
 
     lv_obj_t *lbl_now_title = lv_label_create(card_now);
-    lv_obj_set_style_text_font(lbl_now_title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lbl_now_title, &lv_font_montserrat_de_12, 0);
     lv_obj_set_style_text_color(lbl_now_title, UI_COLOR_SILVER, 0);
     lv_obj_align(lbl_now_title, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_label_set_text(lbl_now_title, "AKTUELL");
+
+    // Einstufung (GÜNSTIG / MODERAT / TEUER)
+    lbl_status = lv_label_create(card_now);
+    lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_de_12, 0);
+    lv_obj_set_style_text_color(lbl_status, UI_COLOR_SILVER, 0);
+    lv_obj_align(lbl_status, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_label_set_text(lbl_status, "");
 
     lbl_price = lv_label_create(card_now);
     lv_obj_set_style_text_font(lbl_price, &lv_font_montserrat_48, 0);
@@ -110,7 +141,7 @@ void ui_dashboard_create(lv_obj_t *parent) {
     lv_label_set_text(lbl_price, "--");
 
     lbl_unit = lv_label_create(card_now);
-    lv_obj_set_style_text_font(lbl_unit, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(lbl_unit, &lv_font_montserrat_de_14, 0);
     lv_obj_set_style_text_color(lbl_unit, UI_COLOR_SILVER, 0);
     lv_obj_align(lbl_unit, LV_ALIGN_BOTTOM_MID, 0, -4);
     lv_label_set_text(lbl_unit, "ct/kWh");
@@ -125,7 +156,7 @@ void ui_dashboard_create(lv_obj_t *parent) {
     lv_obj_set_style_bg_color(bar_price, UI_COLOR_GREEN, LV_PART_INDICATOR);
 
     lbl_trend = lv_label_create(card_now);
-    lv_obj_set_style_text_font(lbl_trend, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lbl_trend, &lv_font_montserrat_de_12, 0);
     lv_obj_set_style_text_color(lbl_trend, UI_COLOR_SILVER, 0);
     lv_obj_align(lbl_trend, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_label_set_text(lbl_trend, "");
@@ -142,7 +173,7 @@ void ui_dashboard_create(lv_obj_t *parent) {
     lv_obj_set_style_pad_all(card_next, 6, 0);
 
     lv_obj_t *lbl_next_title = lv_label_create(card_next);
-    lv_obj_set_style_text_font(lbl_next_title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lbl_next_title, &lv_font_montserrat_de_12, 0);
     lv_obj_set_style_text_color(lbl_next_title, UI_COLOR_SILVER, 0);
     lv_obj_align(lbl_next_title, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_label_set_text(lbl_next_title, "NÄCHSTE 5 STUNDEN");
@@ -174,9 +205,21 @@ void ui_dashboard_create(lv_obj_t *parent) {
     lv_obj_set_style_radius(btn_chart, 4, 0);
     lv_obj_add_event_cb(btn_chart, cb_chart, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *btn_chart_lbl = lv_label_create(btn_chart);
-    lv_obj_set_style_text_font(btn_chart_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(btn_chart_lbl, &lv_font_montserrat_de_12, 0);
     lv_label_set_text(btn_chart_lbl, "Chart " LV_SYMBOL_RIGHT);
     lv_obj_align(btn_chart_lbl, LV_ALIGN_CENTER, 0, 0);
+
+    // Strommix: Emoji (🔋 erneuerbar / 🛢 fossil) + Anteil
+    img_energy = lv_img_create(ftr);
+    lv_img_set_src(img_energy, &img_emoji_battery);
+    lv_obj_align(img_energy, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_add_flag(img_energy, LV_OBJ_FLAG_HIDDEN);
+
+    lbl_energy = lv_label_create(ftr);
+    lv_obj_set_style_text_font(lbl_energy, &lv_font_montserrat_de_12, 0);
+    lv_obj_set_style_text_color(lbl_energy, UI_COLOR_SILVER, 0);
+    lv_obj_align(lbl_energy, LV_ALIGN_LEFT_MID, 34, 0);
+    lv_label_set_text(lbl_energy, "");
 }
 
 // ── Daten aktualisieren ───────────────────────────────────────────────────────
@@ -194,6 +237,19 @@ void ui_dashboard_update() {
 
     // Fetch-Icon
     lv_label_set_text(lbl_fetch, isFetching ? LV_SYMBOL_LOOP : LV_SYMBOL_REFRESH);
+
+    // WLAN-Symbol einfärben (grün/gelb/rot nach RSSI)
+#ifdef SIMULATION
+    lv_obj_set_style_text_color(lbl_wifi, UI_COLOR_SILVER, 0);
+#else
+    if (WiFi.status() == WL_CONNECTED) {
+        int rssi = WiFi.RSSI();
+        lv_obj_set_style_text_color(lbl_wifi,
+            rssi > -65 ? UI_COLOR_GREEN : rssi > -80 ? UI_COLOR_YELLOW : UI_COLOR_RED, 0);
+    } else {
+        lv_obj_set_style_text_color(lbl_wifi, UI_COLOR_RED, 0);
+    }
+#endif
 
     // Aktuellen Slot finden
     int idx = current_slot_idx();
@@ -214,19 +270,42 @@ void ui_dashboard_update() {
     lv_label_set_text(lbl_price, pbuf);
     lv_obj_set_style_text_color(lbl_price, col, 0);
 
+    // Einstufung
+    const char* status = (ct <= 0.0f)       ? "GRATIS"
+                       : (ct < PRICE_CHEAP) ? "GÜNSTIG"
+                       : (ct < PRICE_HIGH)  ? "MODERAT" : "TEUER";
+    lv_label_set_text(lbl_status, status);
+    lv_obj_set_style_text_color(lbl_status, col, 0);
+
     // Balken
     int bar_val = (int)(ct * 100);
     lv_bar_set_value(bar_price, bar_val, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_price, col, LV_PART_INDICATOR);
 
-    // Trend (nächste Stunde)
+    // Trend (nächste Stunde) mit Pfeil-Symbol
     if (idx + 1 < slotCount) {
         float diff = slots[idx + 1].ct - ct;
-        char tbuf2[20];
-        snprintf(tbuf2, sizeof(tbuf2), "%+.1f ct", diff);
+        char tbuf2[28];
+        snprintf(tbuf2, sizeof(tbuf2), "%s %+.1f ct",
+                 diff > 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN, diff);
         lv_label_set_text(lbl_trend, tbuf2);
         lv_obj_set_style_text_color(lbl_trend,
             diff > 0 ? UI_COLOR_RED : UI_COLOR_GREEN, 0);
+    }
+
+    // Strommix (renewable 🔋 / fossil 🛢)
+    if (renewValid) {
+        lv_obj_clear_flag(img_energy, LV_OBJ_FLAG_HIDDEN);
+        bool renewable = renewShare >= 50;
+        lv_img_set_src(img_energy, renewable ? &img_emoji_battery : &img_emoji_oil);
+        char ebuf[28];
+        snprintf(ebuf, sizeof(ebuf), "%d%% erneuerbar", renewShare);
+        lv_label_set_text(lbl_energy, ebuf);
+        lv_obj_set_style_text_color(lbl_energy,
+            renewable ? UI_COLOR_GREEN : UI_COLOR_SILVER, 0);
+    } else {
+        lv_obj_add_flag(img_energy, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lbl_energy, "");
     }
 
     // Nächste 5 Stunden Liste
@@ -237,7 +316,7 @@ void ui_dashboard_update() {
         snprintf(row, sizeof(row), "%02d:00  %+.2f ct", st.tm_hour, slots[i].ct);
 
         lv_obj_t *row_lbl = lv_label_create(list_next);
-        lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_de_14, 0);
         lv_obj_set_style_text_color(row_lbl, price_color(slots[i].ct), 0);
         lv_label_set_text(row_lbl, row);
         lv_obj_set_width(row_lbl, LV_PCT(100));
