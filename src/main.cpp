@@ -10,7 +10,13 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <time.h>
+#include <math.h>
 #include "secrets.h"
+#include "panel_color.h"          // PANEL(): Farb-Kompensation fürs Clone-Panel
+#include "img_emoji.h"            // 🔋 / 🛢 als RGB565-Bitmaps (24x24)
+#include "font_de.h"              // Montserrat mit Umlauten/Ø/€ (eigener Renderer)
+#include "tarif.h"                // Börse → Gesamtpreis (Netz, SNAP, Abgaben, USt)
+#include "qrcode.h"               // QR-Code für den Doku-Link (Detail-Ansicht)
 
 // ── Touch-SPI (VSPI – getrennt vom Display) ──────────────────
 #define T_CS   33
@@ -29,6 +35,15 @@ const char* TZ_VIENNA   = "CET-1CEST,M3.5.0,M10.5.0/3";  // auto DST
 const char* NTP1        = "pool.ntp.org";
 const char* NTP2        = "at.pool.ntp.org";
 
+// Strommix-API (Fraunhofer ISE, kein API-Key); "at" ↔ "de" je Standort
+const char* ENERGY_URL     = "https://api.energy-charts.info/public_power";
+const char* ENERGY_COUNTRY = "at";
+
+// Doku-Seite zur Preiszusammensetzung (QR in der Detail-Ansicht).
+// GitHub Pages: Repo-Settings → Pages → Branch main, Ordner /docs
+// Max. 42 Zeichen (QR Version 3, ECC M)!
+const char* DOKU_URL = "https://ru4ert.github.io/ESP32-awattar/";
+
 // Dynamische Dimensionen – liest echte tft-Werte nach init()+setRotation()
 #define SCREEN_W  (tft.width())
 #define SCREEN_H  (tft.height())
@@ -41,17 +56,23 @@ const char* NTP2        = "at.pool.ntp.org";
 #define FETCH_INTERVAL 3600000UL   // 1 h in ms
 #define MINUTE_TICK      60000UL
 
-// RGB565 Farben
-#define C_GREEN   0x07E0
-#define C_YELLOW  0xFFE0
-#define C_RED     0xF800
-#define C_HDR     0x1082
-#define C_BG      0x0861
-#define C_GRAY    0x4208
-#define C_WHITE   0xFFFF
-#define C_CYAN    0x07FF
-#define C_SILVER  0xBDF7  // Hellgrau (bekannt funktionierend)
-#define C_DKGREEN 0x03E0  // Dunkelgrün = C_GREEN bei halber Helligkeit
+// Ab diesem Erneuerbaren-Anteil (%) gilt der Strom als "Öko" (🔋 statt 🛢)
+#define RENEW_THRESHOLD  75
+
+// RGB565 Farben – als ECHTE Zielfarben notiert, PANEL() kompensiert das
+// invertierende/R-B-tauschende Clone-Panel (siehe include/panel_color.h)
+#define C_GREEN   PANEL(0x07E0)
+#define C_YELLOW  PANEL(0xFFE0)
+#define C_RED     PANEL(0xF800)
+#define C_HDR     PANEL(0x1082)
+#define C_BG      PANEL(0x0861)
+#define C_GRAY    PANEL(0x4208)
+#define C_WHITE   PANEL(0xFFFF)
+#define C_BLACK   PANEL(0x0000)
+#define C_CYAN    PANEL(0x07FF)
+#define C_SILVER  PANEL(0xBDF7)
+#define C_DKGREEN PANEL(0x03E0)
+#define C_SNAPBG  PANEL(0x11C3)  // dezentes Dunkelgrün: SNAP-Fenster im Chart
 
 // ── Daten ────────────────────────────────────────────────────
 struct HourSlot { time_t ts; float ct; };  // ct/kWh
@@ -61,9 +82,11 @@ HourSlot  slots[MAX_SLOTS];
 int       slotCount    = 0;
 bool      tomorrowAvail = false;
 bool      isFetching    = false;
+int       renewShare    = -1;     // Anteil Erneuerbare in % (energy-charts)
+bool      renewValid    = false;
 
 // ── UI-Zustand ───────────────────────────────────────────────
-enum Screen { DASHBOARD, CHART };
+enum Screen { DASHBOARD, CHART, DETAIL };
 Screen currentScreen = DASHBOARD;
 bool   showToday     = true;
 bool   needsRedraw   = true;
@@ -84,10 +107,90 @@ bool     fetchPrices();
 void     drawHeader();
 void     drawDashboard();
 void     drawChart();
+void     drawDetail();
 void     handleTouch();
-uint16_t priceColor(float ct);
+uint16_t priceColor(float totalCt, float spotCt);
 int      currentSlotIdx();
 void     getFilteredSlots(HourSlot** out, int& cnt);
+void     fetchRenewableShare();
+
+// ─────────────────────────────────────────────────────────────
+//  Eigener UTF-8-Font-Renderer (Fonts: font_de.h)
+//  Antialiasing durch Blending gegen die bekannte Hintergrundfarbe.
+//  y ist immer die BASELINE, nicht die Oberkante!
+// ─────────────────────────────────────────────────────────────
+static uint32_t utf8Next(const char*& s) {
+    uint8_t c = (uint8_t)*s;
+    if (!c) return 0;
+    s++;
+    if (c < 0x80) return c;
+    if ((c & 0xE0) == 0xC0 && ((uint8_t)*s & 0xC0) == 0x80)
+        return ((uint32_t)(c & 0x1F) << 6) | ((uint8_t)*s++ & 0x3F);
+    if ((c & 0xF0) == 0xE0 && ((uint8_t)s[0] & 0xC0) == 0x80
+                           && ((uint8_t)s[1] & 0xC0) == 0x80) {
+        uint32_t cp = ((uint32_t)(c & 0x0F) << 12)
+                    | (((uint32_t)((uint8_t)s[0] & 0x3F)) << 6)
+                    |  ((uint8_t)s[1] & 0x3F);
+        s += 2;
+        return cp;
+    }
+    return '?';  // ungültige Sequenz
+}
+
+static const DEGlyph* deGlyph(const DEFont& f, uint32_t cp) {
+    for (uint16_t i = 0; i < f.count; i++)
+        if (f.glyphs[i].cp == cp) return &f.glyphs[i];
+    return nullptr;
+}
+
+int deWidth(const DEFont& f, const char* txt) {
+    int w = 0; uint32_t cp;
+    const char* s = txt;
+    while ((cp = utf8Next(s)) != 0) {
+        const DEGlyph* g = deGlyph(f, cp);
+        if (!g) g = deGlyph(f, '?');
+        if (g) w += g->adv;
+    }
+    return w;
+}
+
+void drawDE(int x, int yBase, const char* txt, const DEFont& f,
+            uint16_t fg, uint16_t bgCol) {
+    // fg/bg sind PANEL-kompensiert; fürs Blending zurück in Zielfarben
+    // (PANEL ist selbstinvers), am Ende pro Pixel wieder kompensieren.
+    uint16_t fgT = PANEL(fg), bgT = PANEL(bgCol);
+    uint8_t fr = (fgT >> 11) << 3, fg8 = ((fgT >> 5) & 0x3F) << 2, fb = (fgT & 0x1F) << 3;
+    uint8_t br = (bgT >> 11) << 3, bg8 = ((bgT >> 5) & 0x3F) << 2, bb = (bgT & 0x1F) << 3;
+
+    static uint16_t pixBuf[24 * 24];
+    uint32_t cp;
+    const char* s = txt;
+    while ((cp = utf8Next(s)) != 0) {
+        const DEGlyph* g = deGlyph(f, cp);
+        if (!g) g = deGlyph(f, '?');
+        if (!g) continue;
+        if (g->w > 0 && g->h > 0 && g->w <= 24 && g->h <= 24) {
+            const uint8_t* bm = f.bitmap + g->off;
+            int n = g->w * g->h;
+            for (int i = 0; i < n; i++) {
+                uint8_t a = bm[i];
+                uint8_t r  = ((uint16_t)fr  * a + (uint16_t)br  * (255 - a)) / 255;
+                uint8_t gr = ((uint16_t)fg8 * a + (uint16_t)bg8 * (255 - a)) / 255;
+                uint8_t b  = ((uint16_t)fb  * a + (uint16_t)bb  * (255 - a)) / 255;
+                pixBuf[i] = PANEL(((uint16_t)(r >> 3) << 11)
+                                | ((uint16_t)(gr >> 2) << 5)
+                                |  (uint16_t)(b >> 3));
+            }
+            tft.pushImage(x + g->ox, yBase - g->oy - g->h, g->w, g->h, pixBuf);
+        }
+        x += g->adv;
+    }
+}
+
+void drawDECentered(int yBase, const char* txt, const DEFont& f,
+                    uint16_t fg, uint16_t bgCol) {
+    drawDE((SCREEN_W - deWidth(f, txt)) / 2, yBase, txt, f, fg, bgCol);
+}
 
 // ─────────────────────────────────────────────────────────────
 //  SETUP
@@ -102,8 +205,9 @@ void setup() {
     // Display
     tft.init();
     tft.setRotation(3);   // ST7789 Landscape 180° (USB links)
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(C_WHITE, TFT_BLACK);
+    tft.setSwapBytes(true);  // pushImage: uint16-Werte in Panel-Byte-Reihenfolge
+    tft.fillScreen(C_BLACK);
+    tft.setTextColor(C_WHITE, C_BLACK);
     tft.drawString("Starte...", 10, 110, 2);
 
     // Touch (eigener SPI-Bus)
@@ -117,11 +221,12 @@ void setup() {
     connectWiFi();
     syncNTP();
 
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(C_BLACK);
     tft.drawString("Lade Preise...", 10, 110, 2);
     isFetching = true; drawHeader(); isFetching = false;
 
     fetchPrices();
+    fetchRenewableShare();
     lastFetch = millis();
     needsRedraw = true;
 }
@@ -132,18 +237,22 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // ── Display-Schlaf─Timer ──
+    // ── Display-Schlaf─Timer ── (View komplett auf Default zurücksetzen)
     if (displayOn && now - lastActivity >= SLEEP_TIMEOUT) {
         displayOn     = false;
         sleepTime     = millis();
         currentScreen = DASHBOARD;
+        showToday     = true;
         tooltipIdx    = -1;
         digitalWrite(21, LOW);
+        drawDashboard();     // unsichtbar vorzeichnen → beim Aufwachen steht
+        needsRedraw = false; // sofort die Default-View, nicht die alte
     }
 
     if (now - lastFetch >= FETCH_INTERVAL) {
         isFetching = true;
         fetchPrices();
+        fetchRenewableShare();
         isFetching  = false;
         lastFetch   = now;
         needsRedraw = true;
@@ -158,8 +267,9 @@ void loop() {
 
     if (displayOn && needsRedraw) {
         needsRedraw = false;
-        if (currentScreen == DASHBOARD) drawDashboard();
-        else                             drawChart();
+        if      (currentScreen == DASHBOARD) drawDashboard();
+        else if (currentScreen == CHART)     drawChart();
+        else                                 drawDetail();
     }
 
     delay(50);
@@ -169,7 +279,7 @@ void loop() {
 //  WiFi
 // ─────────────────────────────────────────────────────────────
 void connectWiFi() {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(C_BLACK);
     tft.drawString("WiFi verbinden...", 10, 110, 2);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     int tries = 0;
@@ -250,22 +360,95 @@ bool fetchPrices() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Helpers
+//  Strommix: Anteil Erneuerbare an der Erzeugung (energy-charts)
 // ─────────────────────────────────────────────────────────────
-// Dashboard-Hintergrund
-uint16_t priceColor(float ct) {
-    if (ct < 0)    return 0x0340;  // Dunkelgrün (Negativ)
-    if (ct < 5.0)  return C_GREEN; // Helles Grün
-    if (ct < 15.0) return 0x4208;  // Dunkelgrau (Mittel)
-    return C_RED;                   // Rot (Teuer)
+void fetchRenewableShare() {
+    if (WiFi.status() != WL_CONNECTED) { renewValid = false; return; }
+
+    // API akzeptiert nur ISO-Daten; start=end=heute liefert den bisherigen
+    // Tag als 15-min-Serie (~6 KB)
+    struct tm tmD; getLocalTime(&tmD);
+    char day[12];
+    strftime(day, sizeof(day), "%Y-%m-%d", &tmD);
+    char url[160];
+    snprintf(url, sizeof(url), "%s?country=%s&start=%s&end=%s",
+             ENERGY_URL, ENERGY_COUNTRY, day, day);
+
+    HTTPClient http;
+    http.begin(url);
+    int code = http.GET();
+    if (code != 200) { http.end(); renewValid = false; return; }
+    String payload = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) { renewValid = false; return; }
+
+    float ren = 0, fossil = 0, directShare = -1;
+    for (JsonObject pt : doc["production_types"].as<JsonArray>()) {
+        const char* name = pt["name"] | "";
+        JsonArray data = pt["data"].as<JsonArray>();
+
+        float v = NAN;  // letzten gültigen Messwert der Serie nehmen
+        for (int i = (int)data.size() - 1; i >= 0; i--) {
+            if (!data[i].isNull()) { v = data[i].as<float>(); break; }
+        }
+        if (isnan(v)) continue;
+
+        // Falls die API den Anteil direkt liefert, hat der Vorrang
+        if (strcmp(name, "Renewable share of generation") == 0) {
+            directShare = v;
+            continue;
+        }
+        if (v < 0) v = 0;  // z.B. Pumpspeicher im Pump-Betrieb
+
+        bool isRen = strstr(name, "Solar") || strstr(name, "Wind")
+                  || strstr(name, "Biomass") || strstr(name, "Geothermal")
+                  || (strstr(name, "Hydro") && !strstr(name, "pumped"));
+        bool isFos = strstr(name, "Fossil") || strstr(name, "Nuclear")
+                  || strstr(name, "Waste")  || strstr(name, "Other");
+        if (isRen)      ren    += v;
+        else if (isFos) fossil += v;
+        // Rest (Load, Residual load, ...) ignorieren
+    }
+
+    if (directShare >= 0)         renewShare = (int)(directShare + 0.5f);
+    else if (ren + fossil > 0.0f) renewShare = (int)(ren * 100.0f / (ren + fossil) + 0.5f);
+    else { renewValid = false; return; }
+
+    renewValid = true;
+    Serial.printf("Erneuerbaren-Anteil (%s): %d%%\n", ENERGY_COUNTRY, renewShare);
 }
 
-// Chart-Balken
-uint16_t barColor(float ct) {
-    if (ct < 0)    return C_CYAN;   // Negativ  → erscheint blau
-    if (ct < 5.0)  return C_GREEN;  // Günstig  → erscheint grün
-    if (ct < 15.0) return C_GRAY;   // Mittel   → erscheint grau ✓
-    return C_RED;                    // Teuer    → erscheint gelb (Hardware-Limit)
+// ─────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────
+// Preis-Stufen auf den GESAMTpreis (Schwellen in tarif.h); negative
+// Börsenpreise bleiben als "geschenkt" (türkis) markiert.
+// Dashboard-Hintergrund (dunkle Varianten, damit weißer Text lesbar bleibt)
+uint16_t priceColor(float totalCt, float spotCt) {
+    if (spotCt < 0)              return PANEL(0x038E);  // Dunkles Türkis
+    if (totalCt < T_TOTAL_CHEAP) return PANEL(0x0340);  // Dunkles Grün
+    if (totalCt <= T_TOTAL_HIGH) return PANEL(0xA400);  // Dunkles Gold
+    return PANEL(0xA000);                               // Dunkles Rot
+}
+
+// Chart-Balken als ZIELfarbe (echtes RGB565) – PANEL() erst beim Zeichnen,
+// damit die Auswahl-Aufhellung im echten Farbraum gerechnet werden kann
+uint16_t barColorTarget(float totalCt, float spotCt) {
+    if (spotCt < 0)              return 0x07FF;  // Cyan (Börse negativ)
+    if (totalCt < T_TOTAL_CHEAP) return 0x07E0;  // Grün
+    if (totalCt <= T_TOTAL_HIGH) return 0xFFE0;  // Gelb
+    return 0xF800;                               // Rot
+}
+
+// 50 % Richtung Weiß – macht den angetippten Balken auch zwischen
+// gleichfarbigen Nachbarn klar erkennbar
+uint16_t lightenTarget(uint16_t c) {
+    uint8_t r = ((c >> 11) & 0x1F), g = ((c >> 5) & 0x3F), b = (c & 0x1F);
+    return ((uint16_t)((r + 31) / 2) << 11)
+         | ((uint16_t)((g + 63) / 2) << 5)
+         |  (uint16_t)((b + 31) / 2);
 }
 
 int currentSlotIdx() {
@@ -297,13 +480,10 @@ void showToast(const char* msg) {
     int tx = (SCREEN_W - TW) / 2;
     int ty = (SCREEN_H - TH) / 2;
     // Hintergrund + Rahmen
-    tft.fillRoundRect(tx, ty, TW, TH, 6, 0x2945);
+    tft.fillRoundRect(tx, ty, TW, TH, 6, PANEL(0x2945));
     tft.drawRoundRect(tx, ty, TW, TH, 6, C_YELLOW);
-    // Text zentriert
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(C_YELLOW, 0x2945);
-    tft.drawString(msg, SCREEN_W / 2, SCREEN_H / 2, 2);
-    tft.setTextDatum(TL_DATUM);
+    // Text zentriert (UTF-8-fähig)
+    drawDECentered(SCREEN_H / 2 + 5, msg, FONT_DE14, C_YELLOW, PANEL(0x2945));
     delay(2000);
     needsRedraw = true;
 }
@@ -347,52 +527,75 @@ void drawHeader() {
 // ─────────────────────────────────────────────────────────────
 void drawDashboard() {
     int cur = currentSlotIdx();
-    float ct = (cur >= 0) ? slots[cur].ct : 0.0f;
-    uint16_t bg = priceColor(ct);
+    float ct  = (cur >= 0) ? slots[cur].ct : 0.0f;                    // Börse
+    float tot = (cur >= 0) ? totalPrice(ct, slots[cur].ts) : 0.0f;    // Gesamt
+    uint16_t bg = priceColor(tot, ct);
 
     // Ganzen Screen löschen (verhindert Artefakte)
     tft.fillScreen(bg);
     drawHeader();
 
-    // Großer Preis (Font 7 = 7-Segment)
+    // Großer Preis = GESAMTPREIS inkl. Netz/Abgaben/USt (Font 7 = 7-Segment)
     char pBuf[10];
-    sprintf(pBuf, ct < 0 ? "%.1f" : "%.1f", ct);
+    sprintf(pBuf, "%.1f", tot);
     tft.setTextColor(C_WHITE, bg);
     tft.setTextDatum(MC_DATUM);
     tft.drawString(pBuf, SCREEN_W / 2, HDR_H + 65, 7);
+    tft.setTextDatum(TL_DATUM);
 
-    // Einheit
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(C_WHITE, bg);
-    tft.drawString("ct / kWh", SCREEN_W / 2, HDR_H + 120, 2);
+    // Einheit + Börsenpreis-Referenz (+ SNAP-Hinweis im Rabattfenster)
+    char uBuf[48];
+    snprintf(uBuf, sizeof(uBuf), "ct/kWh gesamt | Börse %.1f%s",
+             ct, (cur >= 0 && snapAktiv(slots[cur].ts)) ? " | SNAP" : "");
+    drawDECentered(HDR_H + 126, uBuf, FONT_DE10, C_WHITE, bg);
 
-    // Preis-Label (Günstig/Moderat/Teuer)
-    const char* label = (ct < 5) ? "GUENSTIG" : (ct < 15) ? "MODERAT" : "TEUER";
-    tft.setTextColor(C_WHITE, bg);
-    tft.drawString(label, SCREEN_W / 2, HDR_H + 140, 2);
+    // Preis-Label (Stufen wie priceColor)
+    const char* label = (ct < 0)                ? "GESCHENKT"
+                      : (tot < T_TOTAL_CHEAP)   ? "GÜNSTIG"
+                      : (tot <= T_TOTAL_HIGH)   ? "MODERAT" : "TEUER";
+    drawDECentered(HDR_H + 148, label, FONT_DE14, C_WHITE, bg);
 
     // Refresh-Button
-    tft.setTextDatum(TL_DATUM);
     tft.drawRect(SCREEN_W - 50, HDR_H + 4, 46, 18, C_WHITE);
     tft.setTextColor(C_WHITE, bg);
     tft.drawString("Refresh", SCREEN_W - 48, HDR_H + 7, 1);
 
-    // Footer – Trend
+    // Strommix-Badge: 🔋 erneuerbar / 🛢 fossil (links unter dem Header)
+    // Zeigt den Anteil Erneuerbarer an der aktuellen Stromerzeugung (AT)
+    if (renewValid) {
+        bool renewable = renewShare >= RENEW_THRESHOLD;
+        tft.fillRoundRect(6, HDR_H + 6, 84, 34, 6, C_HDR);
+        tft.pushImage(11, HDR_H + 11, 24, 24,
+                      renewable ? IMG_BATTERY_24 : IMG_OIL_24);
+        char rBuf[8];
+        snprintf(rBuf, sizeof(rBuf), "%d%%", renewShare);
+        drawDE(41, HDR_H + 20, rBuf, FONT_DE14,
+               renewable ? C_GREEN : C_SILVER, C_HDR);
+        drawDE(41, HDR_H + 34, renewable ? "Öko" : "Fossil",
+               FONT_DE10, C_SILVER, C_HDR);
+    }
+
+    // Footer – Trend (auf Gesamtpreis)
     tft.fillRect(0, SCREEN_H - FTR_H, SCREEN_W, FTR_H, C_HDR);
-    tft.setTextColor(C_WHITE, C_HDR);
     if (cur >= 0 && cur + 1 < slotCount) {
-        float nextCt = slots[cur + 1].ct;
+        float nextCt = totalPrice(slots[cur + 1].ct, slots[cur + 1].ts);
+        bool  steigt = nextCt > tot;
         char fBuf[48];
-        sprintf(fBuf, "Naechste Std: %.1f ct %s", nextCt,
-                nextCt > ct ? " (steigt ^)" : " (sinkt v)");
-        tft.drawString(fBuf, 8, SCREEN_H - FTR_H + 8, 2);
+        sprintf(fBuf, "Nächste Std: %.1f ct", nextCt);
+        drawDE(8, SCREEN_H - FTR_H + 18, fBuf, FONT_DE14, C_WHITE, C_HDR);
+        // Trend-Pfeil (Dreieck) rechts
+        int ax = SCREEN_W - 22, ayM = SCREEN_H - FTR_H / 2;
+        if (steigt)
+            tft.fillTriangle(ax - 6, ayM + 4, ax + 6, ayM + 4, ax, ayM - 5, C_RED);
+        else
+            tft.fillTriangle(ax - 6, ayM - 4, ax + 6, ayM - 4, ax, ayM + 5, C_GREEN);
     } else {
-        tft.drawString("Kein Trend verfuegbar", 8, SCREEN_H - FTR_H + 8, 2);
+        drawDE(8, SCREEN_H - FTR_H + 18, "Kein Trend verfügbar",
+               FONT_DE14, C_WHITE, C_HDR);
     }
 
     // Tap-Hint
-    tft.setTextColor(C_GRAY, bg);
-    tft.drawString("Tippen fuer Chart ->", 8, SCREEN_H - FTR_H - 14, 1);
+    drawDE(8, SCREEN_H - FTR_H - 6, "Tippen für Chart", FONT_DE10, C_GRAY, bg);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -418,17 +621,31 @@ void drawChart() {
     }
 
     {
-        // Min / Max / Avg
-        float minP = view[0]->ct, maxP = view[0]->ct, sum = 0;
+        // Min / Max / Avg – alles auf GESAMTpreis (inkl. Netz/SNAP/USt)
+        float totals[24];
+        float minP = 1e9f, maxP = -1e9f, sum = 0;
         for (int i = 0; i < cnt; i++) {
-            if (view[i]->ct < minP) minP = view[i]->ct;
-            if (view[i]->ct > maxP) maxP = view[i]->ct;
-            sum += view[i]->ct;
+            totals[i] = totalPrice(view[i]->ct, view[i]->ts);
+            if (totals[i] < minP) minP = totals[i];
+            if (totals[i] > maxP) maxP = totals[i];
+            sum += totals[i];
         }
         float avg = sum / cnt;
 
-        // Feste Y-Achse in 5ct-Schritten (inkl. 0 wenn nötig)
-        float yMin   = floorf(min(minP, 0.0f) / 5.0f) * 5.0f;
+        // SNAP-Fenster dezent grün hinterlegen (wie im aWATTar-Portal);
+        // Grid und Balken zeichnen danach darüber
+        float bwf = (float)CW / cnt;
+        for (int i = 0; i < cnt; i++) {
+            if (!snapAktiv(view[i]->ts)) continue;
+            int x0 = CX + (int)(i * bwf);
+            int x1 = CX + (int)((i + 1) * bwf);
+            tft.fillRect(x0, CY, x1 - x0, CH, C_SNAPBG);
+        }
+
+        // Y-Achse in 5ct-Schritten (Gesamtpreise sind praktisch nie negativ,
+        // daher kein 0-Zwang mehr – nutzt die Chart-Höhe besser aus)
+        float yMin   = floorf(min(minP, 0.0f) < 0 ? min(minP, 0.0f) / 5.0f
+                                                  : minP / 5.0f) * 5.0f;
         float yMax   = ceilf(maxP / 5.0f) * 5.0f;
         if (yMax <= yMin) yMax = yMin + 5.0f;
         float yRange = yMax - yMin;
@@ -453,27 +670,22 @@ void drawChart() {
         int curMin  = tmN->tm_min;
 
         for (int i = 0; i < cnt; i++) {
-            float pr  = view[i]->ct;
+            float pr  = totals[i];
             int   bh  = max(2, (int)((pr - yMin) / yRange * CH));
             int   bx  = CX + (int)(i * bw);
             int   by  = CY + CH - bh;
             int   bwi = max(1, (int)bw - 1);
 
-            uint16_t col     = barColor(pr);
-            uint16_t fillCol = col;
-            if (i == tooltipIdx) {
-                uint8_t r = min(31, ((col >> 11) & 0x1F) + 8);
-                uint8_t g = min(63, ((col >> 5)  & 0x3F) + 16);
-                uint8_t b = min(31, (col & 0x1F) + 8);
-                fillCol = ((uint16_t)r << 11) | ((uint16_t)g << 5) | b;
-            }
-            tft.fillRect(bx, by, bwi, bh, fillCol);
+            // Angetippter Balken: aufgehellte Füllung + weißer Rahmen
+            uint16_t tcol = barColorTarget(pr, view[i]->ct);
+            if (i == tooltipIdx) tcol = lightenTarget(tcol);
+            tft.fillRect(bx, by, bwi, bh, PANEL(tcol));
 
             struct tm* st = localtime(&view[i]->ts);
             if (showToday && st->tm_hour == curHour)
                 tft.drawRect(bx - 1, by - 1, bwi + 2, bh + 2, C_WHITE);
             if (i == tooltipIdx)
-                tft.drawRect(bx - 1, by - 1, bwi + 2, bh + 2, C_YELLOW);
+                tft.drawRect(bx - 1, by - 1, bwi + 2, bh + 2, C_WHITE);
 
             if (i % 4 == 0) {
                 char hb[3]; sprintf(hb, "%02d", st->tm_hour);
@@ -501,17 +713,17 @@ void drawChart() {
         int avgY = CY + CH - (int)((avg - yMin) / yRange * CH);
         for (int x = CX; x < CX + CW; x += 6)
             tft.drawFastHLine(x, avgY, 3, C_WHITE);
-        char avgb[12]; sprintf(avgb, "o%.1f", avg);
-        tft.setTextColor(C_WHITE, C_BG);
-        tft.drawString(avgb, CX + CW - 34, avgY - 7, 1);
+        char avgb[14]; sprintf(avgb, "Ø %.1f", avg);
+        drawDE(CX + CW - 40, avgY - 3, avgb, FONT_DE10, C_WHITE, C_BG);
 
-        // Tooltip
+        // Tooltip: Gesamtpreis + Börse (B) + SNAP-Hinweis
         if (tooltipIdx >= 0 && tooltipIdx < cnt) {
             struct tm* st = localtime(&view[tooltipIdx]->ts);
-            char ttb[32];
-            sprintf(ttb, "%02d-%02dh: %.1f ct",
+            char ttb[48];
+            sprintf(ttb, "%02d-%02dh: %.1f ct (B %.1f%s)",
                     st->tm_hour, (st->tm_hour + 1) % 24,
-                    view[tooltipIdx]->ct);
+                    totals[tooltipIdx], view[tooltipIdx]->ct,
+                    snapAktiv(view[tooltipIdx]->ts) ? ", SNAP" : "");
             tft.fillRect(CX, CY, 200, 13, C_HDR);
             tft.setTextColor(C_YELLOW, C_HDR);
             tft.drawString(ttb, CX + 2, CY + 2, 1);
@@ -525,19 +737,95 @@ buttons:
     // [Heute]
     uint16_t hCol = showToday ? C_WHITE : C_GRAY;
     tft.drawRect(2, SCREEN_H - FTR_H + 2, 70, 22, hCol);
-    tft.setTextColor(hCol, C_HDR);
-    tft.drawString("Heute", 14, SCREEN_H - FTR_H + 7, 2);
+    drawDE(14, SCREEN_H - FTR_H + 18, "Heute", FONT_DE14, hCol, C_HDR);
 
     // [Morgen]
     uint16_t mCol = tomorrowAvail ? (!showToday ? C_WHITE : C_GRAY) : C_GRAY;
     tft.drawRect(76, SCREEN_H - FTR_H + 2, 76, 22, mCol);
-    tft.setTextColor(mCol, C_HDR);
-    tft.drawString("Morgen", 84, SCREEN_H - FTR_H + 7, 2);
+    drawDE(84, SCREEN_H - FTR_H + 18, "Morgen", FONT_DE14, mCol, C_HDR);
 
     // [Zurück]
     tft.drawRect(156, SCREEN_H - FTR_H + 2, 80, 22, C_CYAN);
-    tft.setTextColor(C_CYAN, C_HDR);
-    tft.drawString("< Zurueck", 160, SCREEN_H - FTR_H + 7, 2);
+    drawDE(162, SCREEN_H - FTR_H + 18, "< Zurück", FONT_DE14, C_CYAN, C_HDR);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DETAIL – Preis-Aufschlüsselung des selektierten Balkens
+// ─────────────────────────────────────────────────────────────
+void drawDetail() {
+    // Selektierten Slot aus der aktuellen Chart-Ansicht holen
+    HourSlot* view[24]; int cnt = 0;
+    getFilteredSlots(view, cnt);
+    if (tooltipIdx < 0 || tooltipIdx >= cnt) {
+        currentScreen = CHART; needsRedraw = true; return;
+    }
+    HourSlot* s = view[tooltipIdx];
+    PriceParts p = priceParts(s->ct, s->ts);
+
+    tft.fillScreen(C_BG);
+    drawHeader();
+
+    // Titel
+    struct tm* st = localtime(&s->ts);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Preis-Details  %02d-%02d Uhr",
+             st->tm_hour, (st->tm_hour + 1) % 24);
+    drawDE(12, HDR_H + 20, buf, FONT_DE14, C_WHITE, C_BG);
+
+    // Tabelle links (Label + Wert rechtsbündig), QR-Code rechts daneben
+    const int XL = 16, XR = 200;
+    int y = HDR_H + 40;
+    auto row = [&](const char* lbl, float val, uint16_t col) {
+        drawDE(XL, y, lbl, FONT_DE10, C_SILVER, C_BG);
+        char v[12]; snprintf(v, sizeof(v), "%.2f", val);
+        drawDE(XR - deWidth(FONT_DE10, v), y, v, FONT_DE10, col, C_BG);
+        y += 15;
+    };
+
+    // QR-Code → Doku-Seite (Version 3 = 29x29 Module, 3 px pro Modul)
+    {
+        QRCode qr;
+        uint8_t qrData[qrcode_getBufferSize(3)];
+        if (qrcode_initText(&qr, qrData, 3, ECC_MEDIUM, DOKU_URL) == 0) {
+            const int MOD = 3, QUIET = 4;
+            const int QX = 212, QY = HDR_H + 38;
+            int size = qr.size * MOD;
+            // weiße Quiet-Zone (Scanner brauchen hellen Rand)
+            tft.fillRect(QX - QUIET, QY - QUIET,
+                         size + 2 * QUIET, size + 2 * QUIET, C_WHITE);
+            for (int qy = 0; qy < qr.size; qy++)
+                for (int qx = 0; qx < qr.size; qx++)
+                    if (qrcode_getModule(&qr, qx, qy))
+                        tft.fillRect(QX + qx * MOD, QY + qy * MOD,
+                                     MOD, MOD, C_BLACK);
+            drawDE(QX + 14, QY + size + 16, "Doku", FONT_DE10, C_SILVER, C_BG);
+        }
+    }
+
+    row("Börse (EPEX Spot)",       p.spot,        C_WHITE);
+    row("aWATTar (+3% +1,5)",      p.aufschlag,   C_WHITE);
+    row(p.snap ? "Netznutzung (SNAP -20%)"
+               : "Netznutzung",    p.netz,        p.snap ? C_GREEN : C_WHITE);
+    row("Netzverlust",             p.netzverlust, C_WHITE);
+    row("Elektrizitätsabgabe",     p.eabgabe,     C_WHITE);
+    row("Ökostromförderbeitrag",   p.oeko,        C_WHITE);
+    row("Gebrauchsabgabe (7%)",    p.gebrauchsabg, C_WHITE);
+
+    tft.drawFastHLine(XL, y - 9, XR - XL, C_GRAY);
+    y += 3;
+    row("Netto",                   p.netto,       C_WHITE);
+    row("USt (20%)",               p.ust,         C_WHITE);
+
+    // Summe – groß, volle Breite, in der Preisstufen-Farbe
+    tft.drawFastHLine(XL, y - 9, 300 - XL, C_GRAY);
+    y += 8;
+    uint16_t sumCol = PANEL(barColorTarget(p.brutto, p.spot));
+    drawDE(XL, y, "Summe", FONT_DE14, C_WHITE, C_BG);
+    snprintf(buf, sizeof(buf), "%.1f ct/kWh", p.brutto);
+    drawDE(300 - deWidth(FONT_DE14, buf), y, buf, FONT_DE14, sumCol, C_BG);
+
+    // Hinweis
+    drawDE(XL, SCREEN_H - 5, "Tippen zum Schließen", FONT_DE10, C_GRAY, C_BG);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -594,13 +882,23 @@ void handleTouch() {
         } else {
             sleepTime     = millis();
             currentScreen = DASHBOARD;
+            showToday     = true;
             tooltipIdx    = -1;
             digitalWrite(21, LOW);
+            drawDashboard();     // wie beim Auto-Sleep: Default-View vorzeichnen
+            needsRedraw = false;
         }
         return;
     }
 
     delay(200); // Entprellen
+
+    // Detail-Ansicht: beliebiger Tap schließt sie
+    if (currentScreen == DETAIL) {
+        currentScreen = CHART;
+        needsRedraw   = true;
+        return;
+    }
 
     if (currentScreen == DASHBOARD) {
         // Refresh-Button (oben rechts)
@@ -608,6 +906,7 @@ void handleTouch() {
             isFetching = true; needsRedraw = true;
             if (currentScreen == DASHBOARD) drawHeader();
             fetchPrices();
+            fetchRenewableShare();
             isFetching = false;
             lastFetch  = millis();
             needsRedraw = true;
@@ -631,7 +930,7 @@ void handleTouch() {
                 if (tomorrowAvail) {
                     showToday = false; tooltipIdx = -1; needsRedraw = true;
                 } else {
-                    showToast("Morgen noch nicht verfuegbar");
+                    showToast("Morgen noch nicht verfügbar");
                 }
             } else if (tx >= 156) {               // Zurück
                 currentScreen = DASHBOARD; needsRedraw = true;
@@ -647,7 +946,8 @@ void handleTouch() {
         if (cnt > 0 && tx >= CX) {
             int idx = (int)((tx - CX) / ((float)CW / cnt));
             if (idx >= 0 && idx < cnt) {
-                tooltipIdx = (tooltipIdx == idx) ? -1 : idx; // Toggle
+                if (tooltipIdx == idx) currentScreen = DETAIL;  // 2. Tap: Aufschlüsselung
+                else                   tooltipIdx    = idx;
                 needsRedraw = true;
             }
         }

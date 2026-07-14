@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aWATTar Display – Preiszusammensetzung</title>
+<style>
+  :root {
+    --bg: #0d1b2a; --card: #1b2a3b; --border: #2a3f55;
+    --text: #eef2f6; --muted: #b0bec5;
+    --green: #00c853; --yellow: #ffd600; --red: #ff5252; --cyan: #00e5ff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f7fa; --card:#ffffff; --border:#d8dee6;
+            --text:#1a2330; --muted:#5c6b7a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; background:var(--bg); color:var(--text);
+         font:16px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  h2 { font-size:1.1rem; margin:28px 0 8px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--border);
+          border-radius:12px; padding:16px 18px; margin:12px 0; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums; }
+  td { padding:7px 4px; border-bottom:1px solid var(--border); }
+  td:last-child { text-align:right; white-space:nowrap; }
+  tr.sum td { border-bottom:none; border-top:2px solid var(--border);
+              font-weight:700; font-size:1.05em; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:99px;
+         font-size:.8em; font-weight:600; }
+  .tag.snap { background:rgba(0,200,83,.15); color:var(--green); }
+  .muted { color:var(--muted); font-size:.9em; }
+  .ampel span { display:inline-block; width:.8em; height:.8em; border-radius:3px;
+                margin-right:6px; vertical-align:-1px; }
+  code { background:rgba(128,128,128,.15); padding:1px 6px; border-radius:6px; }
+  a { color:var(--cyan); }
+</style>
+</head>
+<body>
+<main>
+  <h1>⚡ Was kostet die kWh wirklich?</h1>
+  <p class="sub">Preiszusammensetzung des aWATTar-Strompreis-Displays<br>
+  Tarif: aWATTar HOURLY · Wiener Netze · Stand: Juli 2026</p>
+
+  <div class="card">
+    <table>
+      <tr><td>Börsenpreis (EPEX Spot AT)</td><td>variabel, je Stunde</td></tr>
+      <tr><td>aWATTar-Aufschlag</td><td>+ 3 % + 1,50 ct</td></tr>
+      <tr><td>Netznutzungsentgelt <span class="tag snap">SNAP −20 %</span></td>
+          <td>6,98 ct <span class="muted">/ 5,58 ct</span></td></tr>
+      <tr><td>Netzverlustentgelt</td><td>0,70 ct</td></tr>
+      <tr><td>Elektrizitätsabgabe</td><td>0,10 ct</td></tr>
+      <tr><td>Ökostromförderbeitrag (Arbeit + Verlust)</td><td>0,58 + 0,04 ct</td></tr>
+      <tr><td>Gebrauchsabgabe Wien (auf Energie + Netz)</td><td>+ 7 %</td></tr>
+      <tr><td>Umsatzsteuer</td><td>+ 20 %</td></tr>
+      <tr class="sum"><td>Summe = Display-Preis</td><td>brutto, ct/kWh</td></tr>
+    </table>
+    <p class="muted">Alle Einzelwerte netto. Nicht enthalten (Fixkosten, unabhängig
+    vom Einschaltzeitpunkt): Grundgebühr, Leistungspauschale, Messentgelt,
+    Erneuerbaren-Förderpauschale.</p>
+  </div>
+
+  <h2>☀️ SNAP – Sommer-Nieder-Arbeitspreis</h2>
+  <div class="card">
+    <p><strong>1. April – 30. September, täglich 10–16 Uhr:</strong> −20 % auf den
+    Netznutzungs-Arbeitspreis (5,58 statt 6,98 ct/kWh). Voraussetzung: Smart Meter
+    mit Viertelstunden-Opt-In. Im Chart des Displays ist das Fenster
+    <strong>grün hinterlegt</strong> – Verbrauch dorthin verschieben spart doppelt:
+    billige Mittagsbörse + Netzrabatt.</p>
+  </div>
+
+  <h2>🚦 Farb-Ampel am Display</h2>
+  <div class="card ampel">
+    <p>
+      <span style="background:var(--cyan)"></span> Börse negativ – Strom „geschenkt"<br>
+      <span style="background:var(--green)"></span> unter 20 ct gesamt – GÜNSTIG<br>
+      <span style="background:var(--yellow)"></span> 20–30 ct gesamt – MODERAT<br>
+      <span style="background:var(--red)"></span> über 30 ct gesamt – TEUER
+    </p>
+    <p class="muted">Zur Einordnung: Börse 0 ct ≈ 12,7 ct gesamt ·
+    Börse 10 ct ≈ 25 ct gesamt.</p>
+  </div>
+
+  <h2>🔋 Öko / 🛢 Fossil</h2>
+  <div class="card">
+    <p>Das Badge am Dashboard zeigt den Anteil Erneuerbarer an der aktuellen
+    österreichischen Stromerzeugung (Wasser, Wind, Solar, Biomasse) –
+    ab <strong>75 %</strong> gilt der Strom als „Öko" 🔋, darunter „Fossil" 🛢.
+    Datenquelle: <a href="https://energy-charts.info">energy-charts.info</a>
+    (Fraunhofer ISE), stündlich aktualisiert.</p>
+  </div>
+
+  <p class="muted">Konfiguration: <code>include/tarif.h</code> im
+  <a href="https://github.com/ru4ert/ESP32-awattar">ESP32-awattar-Repo</a> ·
+  Werte aus aWATTar-Rechnung 06/2026 · SNAP-Regelung:
+  <a href="https://www.e-control.at">E-Control</a></p>
+</main>
+</body>
+</html>
