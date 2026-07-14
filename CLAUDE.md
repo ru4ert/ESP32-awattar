@@ -85,9 +85,12 @@ kaputt, LVGL siehe unten). Neue Glyphen/Größen: [tools/README.md](tools/README
   (Grenzpreis-Logik), Fixkosten bewusst ausgenommen. SNAP = Apr–Sep,
   10–16 Uhr, −20 % auf Netznutzungs-AP (auf Rechnung verifiziert:
   5,58 = 6,98 × 0,8). Bei Tarifwechsel/Umzug: nur tarif.h anpassen.
-- **QR-Doku**: `DOKU_URL` in main.cpp (max. 42 Zeichen, QR v3!) →
-  GitHub Pages aus `/docs` (Settings → Pages → main + /docs, Repo muss
-  dafür public sein).
+- **QR-Doku**: Der QR in der DETAIL-Ansicht kodiert `DOKU_URL` +
+  GET-Parameter der gescannten Stunde (`?s=<Börse>&h=<Stunde>&d=<MMTT>`);
+  [docs/index.html](docs/index.html) rechnet die Aufschlüsselung clientseitig
+  nach. **Die JS-Konstante `T` dort MUSS mit tarif.h synchron bleiben!**
+  URL gesamt max. 78 Zeichen (QR v4, ECC L). GitHub Pages aus `/docs`
+  (Settings → Pages → main + /docs, Repo muss public sein).
 
 ## Branches
 

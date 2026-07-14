@@ -41,7 +41,9 @@ const char* ENERGY_COUNTRY = "at";
 
 // Doku-Seite zur Preiszusammensetzung (QR in der Detail-Ansicht).
 // GitHub Pages: Repo-Settings → Pages → Branch main, Ordner /docs
-// Max. 42 Zeichen (QR Version 3, ECC M)!
+// An die URL werden GET-Parameter angehängt (?s=Börse&h=Stunde&d=MMTT),
+// die docs/index.html clientseitig auswertet. Gesamtlänge max. 78 Zeichen
+// (QR Version 4, ECC L)!
 const char* DOKU_URL = "https://ru4ert.github.io/ESP32-awattar/";
 
 // Dynamische Dimensionen – liest echte tft-Werte nach init()+setRotation()
@@ -782,13 +784,20 @@ void drawDetail() {
         y += 15;
     };
 
-    // QR-Code → Doku-Seite (Version 3 = 29x29 Module, 3 px pro Modul)
+    // QR-Code → Doku-Seite MIT den Werten dieser Stunde als GET-Parameter;
+    // die Seite rechnet die Aufschlüsselung clientseitig nach.
+    // Version 4 = 33x33 Module, ECC L = max. 78 Zeichen, 3 px pro Modul.
     {
+        struct tm* qt = localtime(&s->ts);
+        char qurl[80];
+        snprintf(qurl, sizeof(qurl), "%s?s=%.2f&h=%d&d=%02d%02d",
+                 DOKU_URL, p.spot, qt->tm_hour, qt->tm_mon + 1, qt->tm_mday);
+
         QRCode qr;
-        uint8_t qrData[qrcode_getBufferSize(3)];
-        if (qrcode_initText(&qr, qrData, 3, ECC_MEDIUM, DOKU_URL) == 0) {
+        uint8_t qrData[qrcode_getBufferSize(4)];
+        if (qrcode_initText(&qr, qrData, 4, ECC_LOW, qurl) == 0) {
             const int MOD = 3, QUIET = 4;
-            const int QX = 212, QY = HDR_H + 38;
+            const int QX = 210, QY = HDR_H + 34;
             int size = qr.size * MOD;
             // weiße Quiet-Zone (Scanner brauchen hellen Rand)
             tft.fillRect(QX - QUIET, QY - QUIET,
@@ -798,7 +807,7 @@ void drawDetail() {
                     if (qrcode_getModule(&qr, qx, qy))
                         tft.fillRect(QX + qx * MOD, QY + qy * MOD,
                                      MOD, MOD, C_BLACK);
-            drawDE(QX + 14, QY + size + 16, "Doku", FONT_DE10, C_SILVER, C_BG);
+            drawDE(QX + 20, QY + size + 16, "Doku", FONT_DE10, C_SILVER, C_BG);
         }
     }
 

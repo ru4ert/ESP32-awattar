@@ -44,6 +44,10 @@
   <p class="sub">Preiszusammensetzung des aWATTar-Strompreis-Displays<br>
   Tarif: aWATTar HOURLY · Wiener Netze · Stand: Juli 2026</p>
 
+  <!-- Wird befüllt, wenn der QR-Code vom Display gescannt wurde
+       (GET-Parameter ?s=Börsenpreis&h=Stunde&d=MMTT) -->
+  <div id="scan" class="card" style="display:none; border-width:2px"></div>
+
   <div class="card">
     <table>
       <tr><td>Börsenpreis (EPEX Spot AT)</td><td>variabel, je Stunde</td></tr>
@@ -97,5 +101,66 @@
   Werte aus aWATTar-Rechnung 06/2026 · SNAP-Regelung:
   <a href="https://www.e-control.at">E-Control</a></p>
 </main>
+
+<script>
+// Rechnet die Aufschlüsselung für die gescannte Stunde nach – MUSS mit
+// include/tarif.h im Repo übereinstimmen!
+const T = {
+  pct: 0.03, fix: 1.50,          // aWATTar: +3 % +1,5 ct
+  netz: 6.98, snapRabatt: 0.20,  // Netznutzung / SNAP
+  nv: 0.70,                      // Netzverlust
+  eabg: 0.10, oeko: 0.62,        // Abgaben je kWh
+  ga: 0.07,                      // Gebrauchsabgabe auf Energie+Netz
+  ust: 0.20,
+  snapMon: [4, 9], snapStd: [10, 16],
+  cheap: 20, high: 30
+};
+
+const q = new URLSearchParams(location.search);
+if (q.has('s')) {
+  const spot = parseFloat(q.get('s'));
+  const h    = parseInt(q.get('h') ?? '-1', 10);
+  const d    = (q.get('d') ?? '').padStart(4, '0');
+  const mon  = parseInt(d.slice(0, 2), 10) || 0;
+  const day  = parseInt(d.slice(2), 10) || 0;
+
+  if (!Number.isNaN(spot) && h >= 0 && h <= 23) {
+    const snap = mon >= T.snapMon[0] && mon <= T.snapMon[1] &&
+                 h >= T.snapStd[0] && h < T.snapStd[1];
+    const auf   = spot * T.pct + T.fix;
+    const netz  = T.netz * (snap ? 1 - T.snapRabatt : 1);
+    const ga    = T.ga * (spot + auf + netz + T.nv);
+    const netto = spot + auf + netz + T.nv + T.eabg + T.oeko + ga;
+    const brutto = netto * (1 + T.ust);
+
+    const col = spot < 0 ? 'var(--cyan)' : brutto < T.cheap ? 'var(--green)'
+              : brutto <= T.high ? 'var(--yellow)' : 'var(--red)';
+    const stufe = spot < 0 ? 'GESCHENKT' : brutto < T.cheap ? 'GÜNSTIG'
+                : brutto <= T.high ? 'MODERAT' : 'TEUER';
+    const f = x => x.toFixed(2).replace('.', ',');
+
+    const el = document.getElementById('scan');
+    el.style.borderColor = col;
+    el.innerHTML = `
+      <h2 style="margin:0 0 10px">📟 Deine gescannte Stunde:
+        ${h}–${h + 1} Uhr${day ? ` am ${day}.${mon}.` : ''}
+        ${snap ? '<span class="tag snap">SNAP −20 %</span>' : ''}</h2>
+      <table>
+        <tr><td>Börse (EPEX Spot)</td><td>${f(spot)} ct</td></tr>
+        <tr><td>aWATTar (+3 % +1,5)</td><td>${f(auf)} ct</td></tr>
+        <tr><td>Netznutzung${snap ? ' <span class="tag snap">SNAP</span>' : ''}</td><td>${f(netz)} ct</td></tr>
+        <tr><td>Netzverlust</td><td>${f(T.nv)} ct</td></tr>
+        <tr><td>Elektrizitätsabgabe</td><td>${f(T.eabg)} ct</td></tr>
+        <tr><td>Ökostromförderbeitrag</td><td>${f(T.oeko)} ct</td></tr>
+        <tr><td>Gebrauchsabgabe (7 %)</td><td>${f(ga)} ct</td></tr>
+        <tr><td>Netto</td><td>${f(netto)} ct</td></tr>
+        <tr><td>USt (20 %)</td><td>${f(netto * T.ust)} ct</td></tr>
+        <tr class="sum"><td>Summe · ${stufe}</td>
+            <td style="color:${col}">${brutto.toFixed(1).replace('.', ',')} ct/kWh</td></tr>
+      </table>`;
+    el.style.display = 'block';
+  }
+}
+</script>
 </body>
 </html>
