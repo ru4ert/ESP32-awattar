@@ -1,113 +1,64 @@
-Projekt-Spezifikation: aWATTar Strompreis-Monitor
+Projekt-Spezifikation: aWATTar Strompreis-Monitor — v2 (Stand Juli 2026)
 
-1. Zielsetzung
+> **Für KI-Agenten:** Die technische Wahrheit (Hardware-Quirks, Architektur,
+> Build, Fallstricke) steht in **CLAUDE.md** — die IMMER zuerst lesen.
+> Dieses Dokument beschreibt Produkt-Ziel, Umsetzungsstand und Backlog.
+> Die ursprüngliche v1-Spezifikation ist in der Git-Historie erhalten.
 
-Entwicklung einer Firmware für ein ESP32-basiertes Touch-Display, um aktuelle und zukünftige Strompreise (aWATTar Österreich/Deutschland) visuell ansprechend darzustellen. Das System soll dem Endnutzer sofort signalisieren, ob Strom gerade teuer oder günstig ist, und eine Planung für den Tag/Morgen ermöglichen.
+1. Zielsetzung (erreicht)
 
-2. Hardware
+Firmware für ein ESP32-Touch-Display, die aktuelle und zukünftige Strompreise
+(aWATTar Österreich) visuell darstellt. Kernidee gegenüber v1 erweitert: Es
+wird nicht der Börsenpreis angezeigt, sondern der TATSÄCHLICH bezahlte
+Gesamtpreis pro kWh (Börse + aWATTar-Aufschlag + Netzentgelte inkl.
+SNAP-Rabatt + Abgaben + USt) — nur so ist „ist Strom gerade günstig?"
+ehrlich beantwortbar.
 
-Board: ESP32-2432S028R (bekannt als "Cheap Yellow Display" / CYD)
+2. Hardware (Ist-Zustand)
 
-Features: ESP32 (WLAN/BT), 2.8" TFT Display (320x240), Resistiver Touchscreen (Stiftbedienung vorgesehen).
+- ESP32 + 2,8" TFT 320×240, resistiver Touch XPT2046 (Stiftbedienung)
+- Panel: ST7789-CLONE („HW-458") mit invertierter Farbdarstellung und
+  R/B-Tausch → Software-Kompensation, Details in CLAUDE.md
+- Verdrahtung nach CYD-Pinout (TFT: HSPI 12/13/14/15/2, BL 21;
+  Touch: VSPI 25/32/33/36/39)
 
-3. Entwicklungsumgebung & Tooling
+3. Umsetzungsstand (main-Branch)
 
-IDE: Antigravity (VSCode-basierter AI-Editor).
+Ansicht 1 – Dashboard: Gesamtpreis in Font 7, Börse-Referenzzeile mit
+SNAP-Hinweis, Einstufung GESCHENKT/GÜNSTIG/MODERAT/TEUER, Strommix-Badge
+(🔋 ≥75 % Erneuerbare / 🛢 darunter, energy-charts.info), Trend-Pfeil,
+Refresh-Button, Tap → Chart.
 
-Framework: PlatformIO.
+Ansicht 2 – Tagesverlauf: 24 farbcodierte Balken (Gesamtpreis), dynamische
+Y-Achse, gestrichelte Ø-Linie mit Wert, SNAP-Fenster (Apr–Sep 10–16 Uhr)
+grün hinterlegt, Jetzt-Markierung, Buttons Heute / Morgen (ausgegraut bis
+~14:00) / Zurück. Tap auf Balken → Tooltip; zweiter Tap → Ansicht 3.
 
-Empfohlene Plugins (VSCode-kompatibel):
+Ansicht 3 – Preis-Details: vollständige Aufschlüsselung (Börse, aWATTar,
+Netznutzung ggf. mit SNAP, Netzverlust, Abgaben, USt, Summe) + QR-Code zur
+öffentlichen Doku-Seite (docs/index.html via GitHub Pages).
 
-PlatformIO IDE (Zwingend erforderlich für Build/Flash/Serial Monitor)
+System: NTP mit Sommerzeit, stündlicher Fetch + manueller Refresh,
+Display-Sleep 30 s mit View-Reset, deutsche Texte mit echten Umlauten
+(eigener Font-Renderer), Tarifwerte zentral in include/tarif.h
+(validiert gegen reale aWATTar-Rechnung 06/2026, Wiener Netze).
 
-C/C++ von Microsoft (Für C++ IntelliSense)
+4. Bewusste Architektur-Entscheidungen
 
-Error Lens (Hebt Syntax-Fehler direkt in der Zeile farblich hervor)
+- Natives TFT_eSPI statt LVGL: Die LVGL-Migration liegt geparkt auf
+  feature/touch-simulator-snapshot (inkl. Wokwi-Sim). Auf dem Clone-Panel
+  war LVGL fehleranfällig; nativ ist auf dieser Hardware bewiesen.
+- Farb-/Rotations-Register des Panels werden NIE angefasst (Clone-Quirk),
+  Farben werden per PANEL()-Makro in Software vorkompensiert.
+- Nur kWh-VARIABLE Kosten im Preis (Grenzpreis-Logik) — Fixkosten wie
+  Grundgebühr/Pauschalen bewusst ausgenommen.
 
-Even Better TOML (Hilft bei der sauberen Formatierung der platformio.ini)
+5. Backlog
 
-4. API & Daten-Strategie
-
-Endpunkt: https://api.awattar.at/v1/marketdata (bzw. .de je nach Standort).
-
-Intervall: Ein HTTP GET Call exakt 1x pro Stunde (z.B. zur Minute 00). Zusätzlich kann der Nutzer jederzeit über einen Touch-Button einen manuellen Fetch auslösen.
-
-Datenhaltung: JSON-Antwort parsen und die Stundenpreise für heute und morgen in einem C++ Struct/Array im RAM speichern.
-
-5. UI/UX Architektur (Empfehlung: TFT_eSPI)
-
-Framework-Entscheidung: Für eine KI-gestützte Entwicklung wird strikt TFT_eSPI (inkl. direkter Touch-Abfrage über XPT2046) empfohlen, um die Entwicklung simpel und ressourcenschonend zu halten.
-
-Globales Element: Statusleiste (Header)
-
-Position: Oberster Bildschirmrand (auf allen Ansichten sichtbar).
-
-Inhalt: Aktuelle Uhrzeit (NTP), WLAN-Empfangsstärke (Icon/Balken) und ein kleines Lade-Icon, das nur aufblinkt, wenn gerade im Hintergrund ein API-Fetch läuft.
-
-Ansicht 1: Dashboard (Standard)
-
-Aktion: Ein kleiner "Refresh"-Button (Icon) für manuellen API-Fetch in der oberen Ecke.
-
-Zentrum: Aktueller Strompreis (Cent/kWh) in sehr großem Font.
-
-Farbcodierter Hintergrund:
-
-Grün: < 10 ct (oder negativ)
-
-Gelb: 10 - 20 ct
-
-Rot: > 20 ct
-
-Footer: Trend-Indikator für die nächste Stunde (Pfeil hoch/runter).
-
-Touch-Aktion: Ein Tap auf den Hauptbereich wechselt zu Ansicht 2.
-
-Ansicht 2: Tagesverlauf (Chart)
-
-Visualisierung: Ein Balkendiagramm der 24 Stunden des gewählten Tages. Jeder Balken übernimmt die Farblogik (Grün/Gelb/Rot) basierend auf seinem Preis.
-
-Durchschnitts-Linie: Eine horizontale, gestrichelte Linie quer über den Chart markiert den Tagesdurchschnittspreis als visuelle Hilfestellung.
-
-Interaktion (Touch-Tooltip): Ein Tap mit dem Stift auf einen spezifischen Balken zeigt oben rechts (oder schwebend) temporär die genaue Uhrzeit und den Preis an (z.B. "18:00 - 19:00: 24,5 ct").
-
-Navigation (Touch-Buttons):
-
-Button "Heute"
-
-Button "Morgen" (Ausgegraut, falls die API noch keine Daten für morgen geliefert hat - meist vor 14:00 Uhr).
-
-Button "Zurück" (zum Dashboard).
-
-6. Referenz-Projekte & Bibliotheken (Für den Agenten)
-
-Der Agent soll sich beim Hardware-Setup (Pin-Belegung) an folgendem GitHub-Repository orientieren:
-
-Hardware Baseline: witnessmenow/ESP32-Cheap-Yellow-Display
-
-TFT-Pins: MISO 12, MOSI 13, SCLK 14, CS 15, DC 2, RST -1, BL 21
-
-Touch-Pins (XPT2046 auf VSPI): CS 33, IRQ 36, MOSI 32, MISO 39, CLK 25.
-
-Benötigte PlatformIO lib_deps:
-
-bodmer/TFT_eSPI (Display)
-
-paulstoffregen/XPT2046_Touchscreen (Touch)
-
-bblanchon/ArduinoJson (API Parsing)
-
-arduino-libraries/NTPClient (Zeitsynchronisierung)
-
-7. Start-Anweisung für den AI Agenten
-
-Setze die platformio.ini mit den exakten Build-Flags für das CYD-Board auf.
-
-Implementiere die WLAN- und NTP-Verbindung.
-
-Baue die Fetch-Logik für die aWATTar-Daten (stündlich + manueller Trigger über den Screen).
-
-Setze das UI-Layout mit der Statusleiste und den Touch-Zonen für den Wechsel zwischen Dashboard, Chart und dem Refresh-Button um. Achte auf die korrekte Implementierung der Tooltips im Chart.
-
-8. Ausblick & Zukünftige Erweiterungen (Backlog)
-
-1-2 Wochen Wetter/Preis-Prognose: Da die aWATTar API (Day-Ahead Markt) systembedingt nur Preise bis maximal morgen Mitternacht liefert, soll in Zukunft evaluiert werden, ob eine externe KI/Wetter-API angebunden werden kann. Diese soll auf Basis von Wind- und Solarprognosen einen groben Preistrend für die nächsten 1 bis 2 Wochen vorhersagen. Die Code-Struktur sollte so modular sein, dass ein solcher zweiter API-Call später leicht integriert werden kann.
+- Wetter-/Preis-Prognose 1–2 Wochen (v1-Idee, weiter offen): externe
+  Wind-/Solarprognose als Trend-Indikator; Code ist modular genug
+  (zweiter Fetch analog fetchRenewableShare()).
+- GitHub Pages aktivieren (Settings → Pages → main + /docs), damit der
+  QR-Code in Ansicht 3 auflöst.
+- Optional: Preise/Schwellen über Doku-Seite oder Captive Portal
+  konfigurierbar statt Compile-Zeit.
