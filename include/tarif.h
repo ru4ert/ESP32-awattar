@@ -14,7 +14,7 @@
 #define T_AWATTAR_FIX   1.50f
 
 // Netz (Wiener Netze): Netznutzungsentgelt Arbeitspreis + Netzverlustentgelt
-#define T_NETZ_AP       6.98f   // lt. Rechnung; im SNAP-Fenster 5,58 (= −20 %)
+#define T_NETZ_AP       6.98f   // lt. Rechnung; im SNAP-/WiNAP-Fenster 5,58 (= −20 %)
 #define T_NETZVERLUST   0.70f
 
 // Abgaben pro kWh
@@ -26,14 +26,20 @@
 // Umsatzsteuer-Faktor
 #define T_UST           1.20f
 
-// ── SNAP: Sommer-Nieder-Arbeitspreis ────────────────────────────────────────
-// 1. April – 30. September, täglich 10:00–16:00 Uhr: −20 % auf den
-// Netznutzungs-Arbeitspreis. Auf der Rechnung bestätigt: 5,58 = 6,98 × 0,8.
-#define SNAP_RABATT       0.20f
+// ── Netz-Rabatte auf den Arbeitspreis (−20 %) ───────────────────────────────
+// SNAP (Sommer-Nieder-Arbeitspreis): 1. April – 30. September, täglich
+// 10:00–16:00 Uhr. Auf der Rechnung bestätigt: 5,58 = 6,98 × 0,8.
+// WiNAP (Winter-Nieder-Arbeitspreis): 1. Oktober – 31. März, täglich
+// 22:00–04:00 Uhr (über Mitternacht). Quelle: awattar.at/blog/winap
+#define NETZ_RABATT       0.20f
 #define SNAP_MONAT_VON    4
 #define SNAP_MONAT_BIS    9
 #define SNAP_STUNDE_VON   10   // inklusive
 #define SNAP_STUNDE_BIS   16   // exklusive
+#define WINAP_MONAT_VON   10   // Oktober … März (Jahreswechsel, s. u.)
+#define WINAP_MONAT_BIS   3
+#define WINAP_STUNDE_VON  22   // inklusive, über Mitternacht bis …
+#define WINAP_STUNDE_BIS  4    // … exklusive
 
 // ── Farbschwellen für den GESAMTpreis (brutto, ct/kWh) ──────────────────────
 // Zur Einordnung: Börse 0 ct → ~12,7 | Börse 10 ct → ~25 | Börse 15 ct → ~31
@@ -41,32 +47,43 @@
 #define T_TOTAL_HIGH    30.0f   // darüber:  TEUER  (rot)
 
 // ── Umrechnung Börse → Gesamtpreis (brutto, pro kWh) ────────────────────────
-static inline bool snapAktiv(time_t ts) {
+enum NetzRabatt : uint8_t { RABATT_KEINER, RABATT_SNAP, RABATT_WINAP };
+
+static inline NetzRabatt netzRabatt(time_t ts) {
     struct tm t; localtime_r(&ts, &t);
     int monat = t.tm_mon + 1;
-    return monat >= SNAP_MONAT_VON && monat <= SNAP_MONAT_BIS
-        && t.tm_hour >= SNAP_STUNDE_VON && t.tm_hour < SNAP_STUNDE_BIS;
+    int h = t.tm_hour;
+    if (monat >= SNAP_MONAT_VON && monat <= SNAP_MONAT_BIS
+        && h >= SNAP_STUNDE_VON && h < SNAP_STUNDE_BIS) return RABATT_SNAP;
+    // WiNAP: Oktober–März, 22–4 Uhr (Monat „über den Jahreswechsel“)
+    if ((monat >= WINAP_MONAT_VON || monat <= WINAP_MONAT_BIS)
+        && (h >= WINAP_STUNDE_VON || h < WINAP_STUNDE_BIS)) return RABATT_WINAP;
+    return RABATT_KEINER;
+}
+
+static inline const char* rabattName(NetzRabatt r) {
+    return r == RABATT_SNAP ? "SNAP" : r == RABATT_WINAP ? "WiNAP" : "";
 }
 
 // Alle Preisbestandteile einzeln (für die Detail-Ansicht im Chart)
 struct PriceParts {
     float spot;          // EPEX-Börsenpreis
     float aufschlag;     // aWATTar: 3 % + 1,5 ct
-    float netz;          // Netznutzung (ggf. mit SNAP-Rabatt)
+    float netz;          // Netznutzung (ggf. mit SNAP-/WiNAP-Rabatt)
     float netzverlust;
     float eabgabe;       // Elektrizitätsabgabe
     float oeko;          // Ökostromförderbeitrag (Arbeit + Verlust)
     float gebrauchsabg;  // 7 % auf Energie + Netz
     float netto, ust, brutto;
-    bool  snap;
+    NetzRabatt rabatt;
 };
 
 static inline PriceParts priceParts(float spotCt, time_t ts) {
     PriceParts p;
     p.spot         = spotCt;
     p.aufschlag    = spotCt * T_AWATTAR_PCT + T_AWATTAR_FIX;
-    p.snap         = snapAktiv(ts);
-    p.netz         = T_NETZ_AP * (p.snap ? (1.0f - SNAP_RABATT) : 1.0f);
+    p.rabatt       = netzRabatt(ts);
+    p.netz         = T_NETZ_AP * (p.rabatt != RABATT_KEINER ? (1.0f - NETZ_RABATT) : 1.0f);
     p.netzverlust  = T_NETZVERLUST;
     p.eabgabe      = T_EABGABE;
     p.oeko         = T_OEKO_ARBEIT + T_OEKO_VERLUST;
