@@ -17,6 +17,7 @@
 #include "font_de.h"              // Montserrat mit Umlauten/Ø/€ (eigener Renderer)
 #include "tarif.h"                // Börse → Gesamtpreis (Netz, SNAP, Abgaben, USt)
 #include "qrcode.h"               // QR-Code für den Doku-Link (Detail-Ansicht)
+#include "gcal.h"                 // Google-Kalender-Preisalarm (Device-Flow)
 
 // ── Touch-SPI (VSPI – getrennt vom Display) ──────────────────
 #define T_CS   33
@@ -88,7 +89,7 @@ int       renewShare    = -1;     // Anteil Erneuerbare in % (energy-charts)
 bool      renewValid    = false;
 
 // ── UI-Zustand ───────────────────────────────────────────────
-enum Screen { DASHBOARD, CHART, DETAIL };
+enum Screen { DASHBOARD, CHART, DETAIL, CAL_PICKER, CAL_PAIRING };
 Screen currentScreen = DASHBOARD;
 bool   showToday     = true;
 bool   needsRedraw   = true;
@@ -110,11 +111,14 @@ void     drawHeader();
 void     drawDashboard();
 void     drawChart();
 void     drawDetail();
+void     drawCalPicker();
+void     drawCalPairing();
 void     handleTouch();
 uint16_t priceColor(float totalCt, float spotCt);
 int      currentSlotIdx();
 void     getFilteredSlots(HourSlot** out, int& cnt);
 void     fetchRenewableShare();
+void     showToast(const char* msg);
 
 // ─────────────────────────────────────────────────────────────
 //  Eigener UTF-8-Font-Renderer (Fonts: font_de.h)
@@ -222,6 +226,7 @@ void setup() {
 
     connectWiFi();
     syncNTP();
+    loadGCalAccounts();
 
     tft.fillScreen(C_BLACK);
     tft.drawString("Lade Preise...", 10, 110, 2);
@@ -240,15 +245,20 @@ void loop() {
     unsigned long now = millis();
 
     // ── Display-Schlaf─Timer ── (View komplett auf Default zurücksetzen)
+    // Ausnahme CAL_PAIRING: der Google-Login am Handy dauert oft länger als
+    // SLEEP_TIMEOUT – das Polling muss im Hintergrund weiterlaufen, sonst
+    // bricht ein Schlaf-Timeout mitten im Pairing lautlos ab.
     if (displayOn && now - lastActivity >= SLEEP_TIMEOUT) {
-        displayOn     = false;
-        sleepTime     = millis();
-        currentScreen = DASHBOARD;
-        showToday     = true;
-        tooltipIdx    = -1;
+        displayOn = false;
+        sleepTime = millis();
         digitalWrite(21, LOW);
-        drawDashboard();     // unsichtbar vorzeichnen → beim Aufwachen steht
-        needsRedraw = false; // sofort die Default-View, nicht die alte
+        if (currentScreen != CAL_PAIRING) {
+            currentScreen = DASHBOARD;
+            showToday     = true;
+            tooltipIdx    = -1;
+            drawDashboard();     // unsichtbar vorzeichnen → beim Aufwachen steht
+            needsRedraw = false; // sofort die Default-View, nicht die alte
+        }
     }
 
     if (now - lastFetch >= FETCH_INTERVAL) {
@@ -267,11 +277,37 @@ void loop() {
 
     handleTouch();
 
+    // Nicht-blockierendes Polling während des Google-Kontokopplung-Wartens:
+    // ein einzelner schneller HTTP-Call pro Intervall, UI bleibt bedienbar
+    // (im Gegensatz zu einem einzigen Blocking-Call über die ganze Wartezeit).
+    if (currentScreen == CAL_PAIRING && millis() >= gcalFlow.nextPollAt) {
+        int r = pollPairing(gcalFlow);
+        if (r == 1) {
+            HourSlot* view[24]; int cnt = 0;
+            getFilteredSlots(view, cnt);
+            bool ok = false;
+            if (tooltipIdx >= 0 && tooltipIdx < cnt) {
+                HourSlot* s = view[tooltipIdx];
+                ok = createCalendarEvent(gcalAccounts[gcalAccountCount - 1], s->ts,
+                                          totalPrice(s->ct, s->ts));
+            }
+            currentScreen = CHART; needsRedraw = true;
+            showToast(ok ? "Termin erstellt" : "Fehler beim Anlegen");
+        } else if (r == 2) {
+            currentScreen = CAL_PICKER; needsRedraw = true;
+            showToast("Kopplung fehlgeschlagen");
+        } else {
+            needsRedraw = true;
+        }
+    }
+
     if (displayOn && needsRedraw) {
         needsRedraw = false;
-        if      (currentScreen == DASHBOARD) drawDashboard();
-        else if (currentScreen == CHART)     drawChart();
-        else                                 drawDetail();
+        if      (currentScreen == DASHBOARD)   drawDashboard();
+        else if (currentScreen == CHART)       drawChart();
+        else if (currentScreen == CAL_PICKER)  drawCalPicker();
+        else if (currentScreen == CAL_PAIRING) drawCalPairing();
+        else                                   drawDetail();
     }
 
     delay(50);
@@ -545,10 +581,11 @@ void drawDashboard() {
     tft.drawString(pBuf, SCREEN_W / 2, HDR_H + 65, 7);
     tft.setTextDatum(TL_DATUM);
 
-    // Einheit + Börsenpreis-Referenz (+ SNAP-Hinweis im Rabattfenster)
+    // Einheit + Börsenpreis-Referenz (+ SNAP-/WiNAP-Hinweis im Rabattfenster)
     char uBuf[48];
-    snprintf(uBuf, sizeof(uBuf), "ct/kWh gesamt | Börse %.1f%s",
-             ct, (cur >= 0 && snapAktiv(slots[cur].ts)) ? " | SNAP" : "");
+    const char* rab = cur >= 0 ? rabattName(netzRabatt(slots[cur].ts)) : "";
+    snprintf(uBuf, sizeof(uBuf), "ct/kWh gesamt | Börse %.1f%s%s",
+             ct, rab[0] ? " | " : "", rab);
     drawDECentered(HDR_H + 126, uBuf, FONT_DE10, C_WHITE, bg);
 
     // Preis-Label (Stufen wie priceColor)
@@ -634,11 +671,11 @@ void drawChart() {
         }
         float avg = sum / cnt;
 
-        // SNAP-Fenster dezent grün hinterlegen (wie im aWATTar-Portal);
+        // Rabattfenster (SNAP/WiNAP) dezent grün hinterlegen (wie im aWATTar-Portal);
         // Grid und Balken zeichnen danach darüber
         float bwf = (float)CW / cnt;
         for (int i = 0; i < cnt; i++) {
-            if (!snapAktiv(view[i]->ts)) continue;
+            if (netzRabatt(view[i]->ts) == RABATT_KEINER) continue;
             int x0 = CX + (int)(i * bwf);
             int x1 = CX + (int)((i + 1) * bwf);
             tft.fillRect(x0, CY, x1 - x0, CH, C_SNAPBG);
@@ -718,14 +755,15 @@ void drawChart() {
         char avgb[14]; sprintf(avgb, "Ø %.1f", avg);
         drawDE(CX + CW - 40, avgY - 3, avgb, FONT_DE10, C_WHITE, C_BG);
 
-        // Tooltip: Gesamtpreis + Börse (B) + SNAP-Hinweis
+        // Tooltip: Gesamtpreis + Börse (B) + SNAP-/WiNAP-Hinweis
         if (tooltipIdx >= 0 && tooltipIdx < cnt) {
             struct tm* st = localtime(&view[tooltipIdx]->ts);
+            const char* rab = rabattName(netzRabatt(view[tooltipIdx]->ts));
             char ttb[48];
-            sprintf(ttb, "%02d-%02dh: %.1f ct (B %.1f%s)",
+            sprintf(ttb, "%02d-%02dh: %.1f ct (B %.1f%s%s)",
                     st->tm_hour, (st->tm_hour + 1) % 24,
                     totals[tooltipIdx], view[tooltipIdx]->ct,
-                    snapAktiv(view[tooltipIdx]->ts) ? ", SNAP" : "");
+                    rab[0] ? ", " : "", rab);
             tft.fillRect(CX, CY, 200, 13, C_HDR);
             tft.setTextColor(C_YELLOW, C_HDR);
             tft.drawString(ttb, CX + 2, CY + 2, 1);
@@ -774,6 +812,18 @@ void drawDetail() {
              st->tm_hour, (st->tm_hour + 1) % 24);
     drawDE(12, HDR_H + 20, buf, FONT_DE14, C_WHITE, C_BG);
 
+    // 📅-Icon (vektor-gezeichnet, kein Bitmap): Tap → Kalender-Konto-Picker
+    // für diese Stunde. Sitzt über der QR-Code-Spalte, wo sonst nichts steht.
+    // Hit-Test dazu in handleTouch() (Bereich 260..300 / 24..48).
+    {
+        int ix = 272, iy = 28;
+        tft.fillRoundRect(ix, iy + 3, 14, 11, 2, C_WHITE);
+        tft.fillRect(ix, iy + 3, 14, 4, C_CYAN);
+        tft.fillRect(ix + 3, iy, 2, 4, C_WHITE);
+        tft.fillRect(ix + 9, iy, 2, 4, C_WHITE);
+        tft.drawRoundRect(ix, iy + 3, 14, 11, 2, C_GRAY);
+    }
+
     // Tabelle links (Label + Wert rechtsbündig), QR-Code rechts daneben
     const int XL = 16, XR = 200;
     int y = HDR_H + 40;
@@ -813,8 +863,10 @@ void drawDetail() {
 
     row("Börse (EPEX Spot)",       p.spot,        C_WHITE);
     row("aWATTar (+3% +1,5)",      p.aufschlag,   C_WHITE);
-    row(p.snap ? "Netznutzung (SNAP -20%)"
-               : "Netznutzung",    p.netz,        p.snap ? C_GREEN : C_WHITE);
+    bool rabatt = p.rabatt != RABATT_KEINER;
+    row(rabatt ? (p.rabatt == RABATT_WINAP ? "Netznutzung (WiNAP -20%)"
+                                           : "Netznutzung (SNAP -20%)")
+               : "Netznutzung",    p.netz,        rabatt ? C_GREEN : C_WHITE);
     row("Netzverlust",             p.netzverlust, C_WHITE);
     row("Elektrizitätsabgabe",     p.eabgabe,     C_WHITE);
     row("Ökostromförderbeitrag",   p.oeko,        C_WHITE);
@@ -835,6 +887,67 @@ void drawDetail() {
 
     // Hinweis
     drawDE(XL, SCREEN_H - 5, "Tippen zum Schließen", FONT_DE10, C_GRAY, C_BG);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  CAL_PICKER – Konto für den Kalender-Preisalarm wählen
+//  Erste Zeile ist immer "+ Konto hinzufügen"; Zeilen-Layout (RY/RH) wird
+//  identisch in handleTouch() für den Hit-Test verwendet.
+// ─────────────────────────────────────────────────────────────
+void drawCalPicker() {
+    tft.fillScreen(C_BG);
+    drawHeader();
+    drawDE(12, HDR_H + 20, "Kalender-Konto wählen", FONT_DE14, C_WHITE, C_BG);
+
+    const int RY = HDR_H + 32, RH = 28;
+    for (int i = -1; i < gcalAccountCount; i++) {
+        int y = RY + (i + 1) * RH;
+        uint16_t col = (i < 0) ? C_CYAN : C_WHITE;
+        tft.drawRect(12, y, SCREEN_W - 24, RH - 6, col);
+        drawDE(20, y + 18,
+               i < 0 ? "+ Konto hinzufügen" : gcalAccounts[i].email.c_str(),
+               FONT_DE14, col, C_BG);
+    }
+
+    tft.drawRect(12, SCREEN_H - FTR_H + 2, 90, 22, C_GRAY);
+    drawDE(20, SCREEN_H - FTR_H + 18, "< Zurück", FONT_DE14, C_GRAY, C_BG);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  CAL_PAIRING – Google-Konto koppeln (QR zur Apps-Script-Brücke, die den
+//  echten OAuth-Authorization-Code-Flow übernimmt, siehe tools/gcal-bridge.gs)
+// ─────────────────────────────────────────────────────────────
+void drawCalPairing() {
+    tft.fillScreen(C_BG);
+    drawHeader();
+
+    // QR-Code: kurzer Link zur Brücke (?start=<SessionId>), die Brücke baut
+    // die eigentliche (viel längere) Google-Consent-URL server-seitig –
+    // Version 8 hat genug Reserve für Brücken-URL + 32-stellige SessionId.
+    QRCode qr;
+    uint8_t qrData[qrcode_getBufferSize(8)];
+    if (qrcode_initText(&qr, qrData, 8, ECC_LOW, gcalFlow.qrUrl.c_str()) == 0) {
+        const int MOD = 2, QUIET = 4;
+        int size = qr.size * MOD;
+        int QX = (SCREEN_W - size) / 2;
+        int QY = HDR_H + 6;
+        tft.fillRect(QX - QUIET, QY - QUIET, size + 2 * QUIET, size + 2 * QUIET, C_WHITE);
+        for (int qy = 0; qy < qr.size; qy++)
+            for (int qx = 0; qx < qr.size; qx++)
+                if (qrcode_getModule(&qr, qx, qy))
+                    tft.fillRect(QX + qx * MOD, QY + qy * MOD, MOD, MOD, C_BLACK);
+        drawDECentered(QY + size + 16, "Mit dem Handy scannen", FONT_DE10, C_SILVER, C_BG);
+        // Google zeigt bei mehreren angemeldeten Konten im Browser manchmal
+        // eine Drive-Fehlerseite statt der Anmeldung ("authuser"-Verwechslung,
+        // Google-eigene Eigenheit, nicht im Script zu fixen) – Hinweis dazu.
+        drawDECentered(QY + size + 34, "Mehrere Google-Konten am Handy?",
+                       FONT_DE10, C_GRAY, C_BG);
+        drawDECentered(QY + size + 50, "Dann Inkognito-Tab verwenden",
+                       FONT_DE10, C_GRAY, C_BG);
+    }
+
+    tft.drawRect(12, SCREEN_H - FTR_H + 2, 110, 22, C_GRAY);
+    drawDE(20, SCREEN_H - FTR_H + 18, "Abbrechen", FONT_DE14, C_GRAY, C_BG);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -902,10 +1015,61 @@ void handleTouch() {
 
     delay(200); // Entprellen
 
-    // Detail-Ansicht: beliebiger Tap schließt sie
+    // Detail-Ansicht: 📅-Icon (Position siehe drawDetail()) → Kalender-Konto-
+    // Picker, sonst schließt ein beliebiger Tap die Ansicht
     if (currentScreen == DETAIL) {
+        if (tx >= 260 && tx < 300 && ty >= 24 && ty < 48) {
+            currentScreen = CAL_PICKER;
+            needsRedraw   = true;
+            return;
+        }
         currentScreen = CHART;
         needsRedraw   = true;
+        return;
+    }
+
+    // Kalender-Konto-Picker (Layout muss zu drawCalPicker() passen)
+    if (currentScreen == CAL_PICKER) {
+        const int RY = HDR_H + 32, RH = 28;
+        if (ty >= SCREEN_H - FTR_H && tx < 110) {          // < Zurück
+            currentScreen = CHART; needsRedraw = true; return;
+        }
+        if (ty >= RY) {
+            int row = (ty - RY) / RH - 1;   // -1 = "+ Konto hinzufügen"
+            if (row == -1) {
+                if (startPairing(gcalFlow)) currentScreen = CAL_PAIRING;
+                else                           showToast("Fehler beim Start");
+            } else if (row >= 0 && row < gcalAccountCount) {
+                // Sofort sichtbares Feedback, da createCalendarEvent() blockiert
+                // (2 sequenzielle HTTP-Calls) – sonst wirkt das Gerät eingefroren.
+                const int TW = 220, TH = 32;
+                int lx = (SCREEN_W - TW) / 2, ly = (SCREEN_H - TH) / 2;
+                tft.fillRoundRect(lx, ly, TW, TH, 6, PANEL(0x2945));
+                tft.drawRoundRect(lx, ly, TW, TH, 6, C_YELLOW);
+                drawDECentered(SCREEN_H / 2 + 5, "Termin wird angelegt...",
+                               FONT_DE14, C_YELLOW, PANEL(0x2945));
+
+                HourSlot* view[24]; int cnt = 0;
+                getFilteredSlots(view, cnt);
+                bool ok = false;
+                if (tooltipIdx >= 0 && tooltipIdx < cnt) {
+                    HourSlot* s = view[tooltipIdx];
+                    ok = createCalendarEvent(gcalAccounts[row], s->ts,
+                                              totalPrice(s->ct, s->ts));
+                }
+                currentScreen = CHART;
+                showToast(ok ? "Termin erstellt" : "Fehler beim Anlegen");
+            }
+            needsRedraw = true;
+        }
+        return;
+    }
+
+    // Kalender-Pairing: nur "Abbrechen" ist aktiv (Polling läuft in loop())
+    if (currentScreen == CAL_PAIRING) {
+        if (ty >= SCREEN_H - FTR_H && tx < 130) {
+            currentScreen = CAL_PICKER; needsRedraw = true;
+        }
         return;
     }
 
@@ -930,6 +1094,7 @@ void handleTouch() {
 
     } else { // CHART
         int btnY = SCREEN_H - FTR_H;
+        const int CX = 28;
 
         // Buttons
         if (ty >= btnY) {
@@ -948,7 +1113,6 @@ void handleTouch() {
         }
 
         // Balken antippen → Tooltip
-        const int CX = 28;
         const int CW = SCREEN_W - CX - 4;
         HourSlot* view[24]; int cnt = 0;
         getFilteredSlots(view, cnt);

@@ -82,9 +82,11 @@ kaputt, LVGL siehe unten). Neue Glyphen/Größen: [tools/README.md](tools/README
   „Renewable share of generation", sonst Namens-Klassifikation.
 - **Tarifmodell** ([include/tarif.h](include/tarif.h)): Werte aus der realen
   aWATTar-Rechnung 06/2026 (Wiener Netze). Nur kWh-variable Posten
-  (Grenzpreis-Logik), Fixkosten bewusst ausgenommen. SNAP = Apr–Sep,
-  10–16 Uhr, −20 % auf Netznutzungs-AP (auf Rechnung verifiziert:
-  5,58 = 6,98 × 0,8). Bei Tarifwechsel/Umzug: nur tarif.h anpassen.
+  (Grenzpreis-Logik), Fixkosten bewusst ausgenommen. Netz-Rabatte −20 % auf
+  Netznutzungs-AP: SNAP = Apr–Sep, 10–16 Uhr (auf Rechnung verifiziert:
+  5,58 = 6,98 × 0,8); WiNAP = Okt–Mär, 22–4 Uhr (ab 1.10.2026, awattar.at/blog/winap).
+  `netzRabatt(ts)` in tarif.h entscheidet. Bei Tarifwechsel/Umzug: nur tarif.h
+  anpassen (+ JS-Konstante `T` in docs/index.html synchron halten).
 - **QR-Doku**: Der QR in der DETAIL-Ansicht kodiert `DOKU_URL` +
   GET-Parameter der gescannten Stunde (`?s=<Börse>&h=<Stunde>&d=<MMTT>`);
   [docs/index.html](docs/index.html) rechnet die Aufschlüsselung clientseitig

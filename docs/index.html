@@ -52,8 +52,8 @@
     <table>
       <tr><td>Börsenpreis (EPEX Spot AT)</td><td>variabel, je Stunde</td></tr>
       <tr><td>aWATTar-Aufschlag</td><td>+ 3 % + 1,50 ct</td></tr>
-      <tr><td>Netznutzungsentgelt <span class="tag snap">SNAP −20 %</span></td>
-          <td>6,98 ct <span class="muted">/ 5,58 ct</span></td></tr>
+      <tr><td>Netznutzungsentgelt</td>
+          <td>6,98 ct <span class="muted">/ 5,58 ct in SNAP- bzw. WiNAP-Fenster</span></td></tr>
       <tr><td>Netzverlustentgelt</td><td>0,70 ct</td></tr>
       <tr><td>Elektrizitätsabgabe</td><td>0,10 ct</td></tr>
       <tr><td>Ökostromförderbeitrag (Arbeit + Verlust)</td><td>0,58 + 0,04 ct</td></tr>
@@ -66,13 +66,15 @@
     Erneuerbaren-Förderpauschale.</p>
   </div>
 
-  <h2>☀️ SNAP – Sommer-Nieder-Arbeitspreis</h2>
+  <h2>☀️ SNAP & ❄️ WiNAP – Netz-Rabatte</h2>
   <div class="card">
-    <p><strong>1. April – 30. September, täglich 10–16 Uhr:</strong> −20 % auf den
-    Netznutzungs-Arbeitspreis (5,58 statt 6,98 ct/kWh). Voraussetzung: Smart Meter
-    mit Viertelstunden-Opt-In. Im Chart des Displays ist das Fenster
-    <strong>grün hinterlegt</strong> – Verbrauch dorthin verschieben spart doppelt:
-    billige Mittagsbörse + Netzrabatt.</p>
+    <p><strong>SNAP (Sommer-Nieder-Arbeitspreis) – 1. April bis 30. September, täglich 10–16 Uhr:</strong>
+    −20 % auf den Netznutzungs-Arbeitspreis (5,58 statt 6,98 ct/kWh).</p>
+    <p><strong>WiNAP (Winter-Nieder-Arbeitspreis) – 1. Oktober bis 31. März, täglich 22–4 Uhr:</strong>
+    −20 % auf den Netznutzungs-Arbeitspreis (5,58 statt 6,98 ct/kWh).</p>
+    <p>Voraussetzung: Smart Meter mit Viertelstunden-Auslesung. Im Chart des Displays
+    ist das jeweilige Fenster <strong>grün hinterlegt</strong> – Verbrauch dorthin
+    verschieben spart doppelt: billige Börse + Netzrabatt.</p>
   </div>
 
   <h2>🚦 Farb-Ampel am Display</h2>
@@ -98,7 +100,8 @@
 
   <p class="muted">Konfiguration: <code>include/tarif.h</code> im
   <a href="https://github.com/ru4ert/ESP32-awattar">ESP32-awattar-Repo</a> ·
-  Werte aus aWATTar-Rechnung 06/2026 · SNAP-Regelung:
+  Werte aus aWATTar-Rechnung 06/2026 · SNAP/WiNAP-Regelung:
+  <a href="https://www.awattar.at/blog/winap">aWATTar</a>,
   <a href="https://www.e-control.at">E-Control</a></p>
 </main>
 
@@ -107,12 +110,13 @@
 // include/tarif.h im Repo übereinstimmen!
 const T = {
   pct: 0.03, fix: 1.50,          // aWATTar: +3 % +1,5 ct
-  netz: 6.98, snapRabatt: 0.20,  // Netznutzung / SNAP
+  netz: 6.98, rabatt: 0.20,      // Netznutzung / SNAP+WiNAP (−20 %)
   nv: 0.70,                      // Netzverlust
   eabg: 0.10, oeko: 0.62,        // Abgaben je kWh
   ga: 0.07,                      // Gebrauchsabgabe auf Energie+Netz
   ust: 0.20,
-  snapMon: [4, 9], snapStd: [10, 16],
+  snapMon: [4, 9], snapStd: [10, 16],   // SNAP: Apr–Sep, 10–16 Uhr
+  winapMon: [10, 3], winapStd: [22, 4], // WiNAP: Okt–Mär, 22–4 Uhr (über Mitternacht)
   cheap: 20, high: 30
 };
 
@@ -127,8 +131,11 @@ if (q.has('s')) {
   if (!Number.isNaN(spot) && h >= 0 && h <= 23) {
     const snap = mon >= T.snapMon[0] && mon <= T.snapMon[1] &&
                  h >= T.snapStd[0] && h < T.snapStd[1];
+    const winap = (mon >= T.winapMon[0] || mon <= T.winapMon[1]) &&
+                  (h >= T.winapStd[0] || h < T.winapStd[1]);
+    const rabatt = snap ? 'SNAP' : winap ? 'WiNAP' : '';
     const auf   = spot * T.pct + T.fix;
-    const netz  = T.netz * (snap ? 1 - T.snapRabatt : 1);
+    const netz  = T.netz * (rabatt ? 1 - T.rabatt : 1);
     const ga    = T.ga * (spot + auf + netz + T.nv);
     const netto = spot + auf + netz + T.nv + T.eabg + T.oeko + ga;
     const brutto = netto * (1 + T.ust);
@@ -144,11 +151,11 @@ if (q.has('s')) {
     el.innerHTML = `
       <h2 style="margin:0 0 10px">📟 Deine gescannte Stunde:
         ${h}–${h + 1} Uhr${day ? ` am ${day}.${mon}.` : ''}
-        ${snap ? '<span class="tag snap">SNAP −20 %</span>' : ''}</h2>
+        ${rabatt ? `<span class="tag snap">${rabatt} −20 %</span>` : ''}</h2>
       <table>
         <tr><td>Börse (EPEX Spot)</td><td>${f(spot)} ct</td></tr>
         <tr><td>aWATTar (+3 % +1,5)</td><td>${f(auf)} ct</td></tr>
-        <tr><td>Netznutzung${snap ? ' <span class="tag snap">SNAP</span>' : ''}</td><td>${f(netz)} ct</td></tr>
+        <tr><td>Netznutzung${rabatt ? ` <span class="tag snap">${rabatt}</span>` : ''}</td><td>${f(netz)} ct</td></tr>
         <tr><td>Netzverlust</td><td>${f(T.nv)} ct</td></tr>
         <tr><td>Elektrizitätsabgabe</td><td>${f(T.eabg)} ct</td></tr>
         <tr><td>Ökostromförderbeitrag</td><td>${f(T.oeko)} ct</td></tr>
